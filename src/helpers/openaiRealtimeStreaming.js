@@ -53,6 +53,7 @@ class OpenAIRealtimeStreaming {
     this.ws = null;
     this.isConnected = false;
     this.isConnecting = false;
+    this.sessionConfigurationSent = false;
     this.completedSegments = [];
     this.currentPartial = "";
     this.onPartialTranscript = null;
@@ -132,6 +133,7 @@ class OpenAIRealtimeStreaming {
     if (!this.bufferingAudio) this.beginConnecting();
 
     this.isConnecting = true;
+    this.sessionConfigurationSent = false;
     this.model = model || "gpt-4o-mini-transcribe";
     this.language = normalizeLanguage(language);
     this.prompt = normalizePrompt(prompt, keyterms);
@@ -281,6 +283,7 @@ class OpenAIRealtimeStreaming {
                 },
               })
             );
+            this.sessionConfigurationSent = true;
           }
           break;
         }
@@ -465,7 +468,11 @@ class OpenAIRealtimeStreaming {
 
     if (!changed) return;
 
-    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.isConnected) {
+    if (
+      this.ws &&
+      this.ws.readyState === WebSocket.OPEN &&
+      (this.isConnected || this.sessionConfigurationSent)
+    ) {
       debugLogger.debug(
         `${this.providerLabel} updating session configuration`,
         this._logContext({
@@ -596,8 +603,11 @@ class OpenAIRealtimeStreaming {
 
   sendAudio(pcmBuffer) {
     const isOpen = this.ws?.readyState === WebSocket.OPEN;
+    // Ordering the configuration before PCM needs no session.updated round trip.
+    const waitingForConfiguration =
+      this.isConnecting && !this.preconfigured && !this.sessionConfigurationSent;
 
-    if (!isOpen) {
+    if (!isOpen || waitingForConfiguration) {
       if (this.bufferingAudio && this.coldStartBufferSize < COLD_START_BUFFER_MAX) {
         const copy = Buffer.from(pcmBuffer);
         this.coldStartBuffer.push(copy);
@@ -727,6 +737,7 @@ class OpenAIRealtimeStreaming {
 
     this.isConnected = false;
     this.isConnecting = false;
+    this.sessionConfigurationSent = false;
     this.bufferingAudio = false;
   }
 }

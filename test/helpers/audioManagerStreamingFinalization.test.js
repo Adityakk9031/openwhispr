@@ -352,14 +352,20 @@ async function createStartingManager(t, providerName) {
   const startReached = deferred();
   const connection = deferred();
   const sent = [];
+  const events = [];
+  const firstFrame = new Int16Array([1]).buffer;
   const api = globalThis.window.electronAPI;
   const realtime = providerName.endsWith("-realtime");
   const prefix = realtime ? "dictationRealtime" : "deepgramStreaming";
   api[`${prefix}Start`] = () => {
+    events.push("start");
     startReached.resolve();
     return connection.promise;
   };
-  api[`${prefix}Send`] = (frame) => sent.push(frame);
+  api[`${prefix}Send`] = (frame) => {
+    events.push("send");
+    sent.push(frame);
+  };
   api[`${prefix}Stop`] = async () => ({ success: true });
   const eventNames = realtime
     ? [
@@ -399,7 +405,15 @@ async function createStartingManager(t, providerName) {
     _acquireCaptureStream: async () => stream,
     startStreamingFallbackRecorder() {},
     getOrCreateAudioContext: async () => ({
-      createMediaStreamSource: () => ({ connect() {}, disconnect() {} }),
+      createMediaStreamSource: () => ({
+        connect(target) {
+          if (target.port) {
+            events.push("capture");
+            target.port.onmessage({ data: firstFrame });
+          }
+        },
+        disconnect() {},
+      }),
       createAnalyser: () => ({}),
       audioWorklet: { addModule: async () => {} },
     }),
@@ -407,7 +421,10 @@ async function createStartingManager(t, providerName) {
     getStreamingProvider: AudioManager.prototype.getStreamingProvider,
     getStreamingProviderName: () => providerName,
     getKeyterms: () => [],
-    beginMicRecovery: () => micRecovery.promise,
+    beginMicRecovery: () => {
+      events.push("recovery");
+      return micRecovery.promise;
+    },
     cleanupStreaming: async () => {
       manager.isStreaming = false;
     },
@@ -421,6 +438,8 @@ async function createStartingManager(t, providerName) {
     manager,
     start,
     sent,
+    events,
+    firstFrame,
     connection,
     micRecovery,
     startReached,
@@ -429,33 +448,47 @@ async function createStartingManager(t, providerName) {
 }
 
 for (const providerName of ["openai-realtime", "tinfoil-realtime"]) {
-  test(`${providerName} holds opening audio until configuration completes, then flushes in order`, async (t) => {
+  test(`${providerName} dispatches start before capture and sends four seconds immediately`, async (t) => {
     const harness = await createStartingManager(t, providerName);
-    const frames = [
-      new Int16Array([1]).buffer,
-      new Int16Array([2]).buffer,
-      new Int16Array([3]).buffer,
-    ];
-    harness.emit(frames[0]);
-    assert.deepEqual(harness.sent, [], "mic recovery must not send audio to the warm socket");
-    harness.micRecovery.resolve();
-    await harness.startReached.promise;
-    harness.emit(frames[1]);
+    assert.ok(
+      harness.events.indexOf("start") >= 0,
+      "start must not wait for microphone enumeration"
+    );
+    assert.ok(
+      harness.events.indexOf("start") < harness.events.indexOf("capture"),
+      "session start must be dispatched before the processor's first frame"
+    );
+    assert.deepEqual(harness.sent, [harness.firstFrame]);
+    const frames = Array.from(
+      { length: 4 },
+      (_, index) => new Int16Array(16000).fill(index + 2).buffer
+    );
+    for (const frame of frames) harness.emit(frame);
     harness.emit("flushed");
-    assert.deepEqual(harness.sent, [], "configuration/reconnect must finish before audio is sent");
+    assert.deepEqual(
+      harness.sent,
+      [harness.firstFrame, ...frames],
+      "pending network setup and microphone enumeration must neither delay nor discard PCM"
+    );
+    assert.equal(harness.manager.streamingStartInProgress, true);
+    harness.micRecovery.resolve();
     harness.connection.resolve({ success: true });
     assert.equal(await harness.start, true);
-    harness.emit(frames[2]);
-    assert.deepEqual(harness.sent, frames);
+    assert.deepEqual(
+      harness.sent,
+      [harness.firstFrame, ...frames],
+      "start completion must not replay frames"
+    );
   });
 
   for (const outcome of ["cancel", "failure"]) {
-    test(`${providerName} discards queued opening audio after ${outcome}`, async (t) => {
+    test(`${providerName} stops later audio after ${outcome} without delaying opening audio`, async (t) => {
       const harness = await createStartingManager(t, providerName);
-      harness.emit(new Int16Array([1]).buffer);
+      const openingFrame = new Int16Array([2]).buffer;
+      harness.emit(openingFrame);
+      assert.deepEqual(harness.sent, [harness.firstFrame, openingFrame]);
       harness.micRecovery.resolve();
       await harness.startReached.promise;
-      harness.emit(new Int16Array([2]).buffer);
       const cancellation = outcome === "cancel" ? harness.manager.cancelStreamingRecording() : null;
       harness.connection.resolve(
         outcome === "cancel" ? { success: true } : { success: false, error: "Connection failed" }
@@ -463,56 +496,37 @@ for (const providerName of ["openai-realtime", "tinfoil-realtime"]) {
       assert.equal(await harness.start, false);
       if (cancellation) await cancellation;
       harness.emit(new Int16Array([3]).buffer);
-      assert.deepEqual(harness.sent, [], "abandoned audio must never reach either socket");
+      assert.deepEqual(harness.sent, [harness.firstFrame, openingFrame]);
     });
   }
 }
 
 test("Deepgram keeps sending audio eagerly while start is pending", async (t) => {
   const harness = await createStartingManager(t, "deepgram");
-  const frame = new Int16Array([1]).buffer;
+  const frame = new Int16Array([2]).buffer;
   harness.emit(frame);
-  assert.deepEqual(harness.sent, [frame]);
+  assert.deepEqual(harness.sent, [harness.firstFrame, frame]);
   harness.micRecovery.resolve();
   await harness.startReached.promise;
   harness.connection.resolve({ success: true });
   assert.equal(await harness.start, true);
 });
 
-test("realtime startup buffers at most three seconds of opening audio", async (t) => {
-  const harness = await createStartingManager(t, "openai-realtime");
-  const frames = Array.from({ length: 4 }, () => new ArrayBuffer(16000 * 2));
-  for (const frame of frames) harness.emit(frame);
-  assert.deepEqual(harness.sent, []);
-  harness.micRecovery.resolve();
-  await harness.startReached.promise;
-  harness.connection.resolve({ success: true });
-  assert.equal(await harness.start, true);
-  assert.deepEqual(harness.sent, frames.slice(0, 3));
-  const liveFrame = new Int16Array([5]).buffer;
-  harness.emit(liveFrame);
-  assert.equal(
-    harness.sent.at(-1),
-    liveFrame,
-    "reaching the queue limit must not block live audio"
-  );
-});
-
-test("realtime batch fallback discards opening audio without flushing the old socket", async (t) => {
+test("realtime batch fallback stops forwarding later frames", async (t) => {
   const harness = await createStartingManager(t, "tinfoil-realtime");
   let batchStarts = 0;
   harness.manager.startRecording = async () => {
     batchStarts += 1;
     return true;
   };
-  harness.emit(new Int16Array([1]).buffer);
+  assert.deepEqual(harness.sent, [harness.firstFrame]);
   harness.micRecovery.resolve();
   await harness.startReached.promise;
   harness.connection.resolve({ success: false, code: "NO_API" });
   assert.equal(await harness.start, true);
   assert.equal(batchStarts, 1);
   harness.emit(new Int16Array([2]).buffer);
-  assert.deepEqual(harness.sent, []);
+  assert.deepEqual(harness.sent, [harness.firstFrame]);
 });
 
 test("cancelling streaming processing stays busy until an awaited transform exits", async (t) => {

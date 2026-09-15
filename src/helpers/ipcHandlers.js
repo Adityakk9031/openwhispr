@@ -611,6 +611,8 @@ class IPCHandlers {
     this.cortiStreaming = null;
     this._dictationStreaming = null;
     this._dictationConnectPromise = null;
+    this._dictationConnectionOptions = null;
+    this._dictationRecordingRequested = false;
     this._dictationIdleTimer = null;
     this._dictationPreviewEnabled = false;
     this._meetingMicStreaming = null;
@@ -8009,17 +8011,23 @@ class IPCHandlers {
 
     const setupDictationCallbacks = (streaming, event) => {
       streaming.onPartialTranscript = (text) => {
+        if (this._dictationStreaming !== streaming) return;
         event.sender.send("dictation-realtime-partial", text);
         if (this._dictationPreviewEnabled && text) {
           this.windowManager.showTranscriptionPreview(text);
         }
       };
-      streaming.onFinalTranscript = (text) => event.sender.send("dictation-realtime-final", text);
+      streaming.onFinalTranscript = (text) => {
+        if (this._dictationStreaming !== streaming) return;
+        event.sender.send("dictation-realtime-final", text);
+      };
       streaming.onError = (err) => {
+        if (this._dictationStreaming !== streaming) return;
         event.sender.send("dictation-realtime-error", err.message);
         if (this._dictationPreviewEnabled) this.windowManager.hideTranscriptionPreview();
       };
       streaming.onSessionEnd = (data) => {
+        if (this._dictationStreaming !== streaming) return;
         event.sender.send("dictation-realtime-session-end", data || {});
         if (this._dictationPreviewEnabled) this.windowManager.hideTranscriptionPreview();
       };
@@ -8045,6 +8053,15 @@ class IPCHandlers {
       }, DICTATION_IDLE_TIMEOUT_MS);
     };
 
+    const matchesDictationConnection = (options) => {
+      const connectedOptions = this._dictationConnectionOptions;
+      return (
+        connectedOptions &&
+        connectedOptions.provider === (options.provider || "openai-realtime") &&
+        (connectedOptions.mode === "byok") === (options.mode === "byok")
+      );
+    };
+
     const connectDictationStreaming = async (event, options) => {
       // Older renderers did not label the OpenAI dictation adapter. Dictation
       // realtime was OpenAI-only before Tinfoil support, so preserve that
@@ -8054,18 +8071,11 @@ class IPCHandlers {
         provider: options?.provider || "openai-realtime",
       };
 
-      if (this._dictationConnectPromise) {
-        await this._dictationConnectPromise.catch(() => {});
-      }
-
       clearDictationIdleTimer();
       this._dictationPreviewEnabled = !!options.preview;
+      this._dictationConnectionOptions = options;
 
-      if (this._dictationStreaming) {
-        await this._dictationStreaming.disconnect().catch(() => {});
-        this._dictationStreaming = null;
-      }
-
+      const previousStreaming = this._dictationStreaming;
       const connectInner = async () => {
         const isCloud = options.mode !== "byok";
         // Dictation renderers before 1.8.4 omit `provider` and mean OpenAI; the
@@ -8079,11 +8089,17 @@ class IPCHandlers {
         // of silently dropping the start of the recording.
         streaming.beginConnecting();
         this._dictationStreaming = streaming;
+        if (previousStreaming?.isConnected) {
+          previousStreaming.disconnect({ commit: false }).catch(() => {});
+        }
         try {
           const apiKey = await fetchRealtimeToken(event, {
             mode: options.mode,
             provider,
           });
+          if (this._dictationStreaming !== streaming) {
+            throw new Error("Dictation warmup was superseded");
+          }
           if (provider === "tinfoil-realtime") {
             const model = options.model || TINFOIL_REALTIME_MODEL;
             await streaming.connect({
@@ -8108,17 +8124,22 @@ class IPCHandlers {
               preconfigured: isCloud,
             });
           }
+          if (this._dictationStreaming !== streaming) {
+            await streaming.disconnect({ commit: false });
+            throw new Error("Dictation warmup was superseded");
+          }
         } catch (err) {
           if (this._dictationStreaming === streaming) this._dictationStreaming = null;
           throw err;
         }
       };
 
-      this._dictationConnectPromise = connectInner();
+      const connectPromise = connectInner();
+      this._dictationConnectPromise = connectPromise;
       try {
-        await this._dictationConnectPromise;
+        await connectPromise;
       } finally {
-        this._dictationConnectPromise = null;
+        if (this._dictationConnectPromise === connectPromise) this._dictationConnectPromise = null;
       }
     };
 
@@ -8750,9 +8771,20 @@ class IPCHandlers {
     };
 
     ipcMain.handle("dictation-realtime-warmup", async (event, options = {}) => {
+      if (this._dictationRecordingRequested) return { success: true };
       try {
-        await connectDictationStreaming(event, options);
-        startDictationIdleTimer();
+        // An omitted language cannot clear a pinned hint in session.update.
+        // Leave warm sessions neutral so Auto can reuse them without redialing.
+        const warmupOptions =
+          options.mode === "byok" || options.provider === "tinfoil-realtime"
+            ? { ...options, language: undefined }
+            : options;
+        if (this._dictationConnectPromise && matchesDictationConnection(options)) {
+          await this._dictationConnectPromise;
+        } else {
+          await connectDictationStreaming(event, warmupOptions);
+        }
+        if (!this._dictationRecordingRequested) startDictationIdleTimer();
         return { success: true };
       } catch (err) {
         return streamingStartFailure(err);
@@ -8760,27 +8792,35 @@ class IPCHandlers {
     });
 
     ipcMain.handle("dictation-realtime-start", async (event, options = {}) => {
+      this._dictationRecordingRequested = true;
+      let recordingStreaming = this._dictationStreaming;
       try {
         clearDictationIdleTimer();
         this._dictationPreviewEnabled = !!options.preview;
-        const streaming = this._dictationStreaming;
-        // Auto is omitted by routing; omitting it in session.update retains the old hint.
-        const resetLanguage =
-          !streaming?.preconfigured &&
-          streaming?.language &&
-          (!options.language || options.language === "auto");
-        if (!streaming?.isConnected || resetLanguage) {
-          await connectDictationStreaming(event, options);
+        const sessionOptions = {
+          language: options.language,
+          model: options.model,
+          prompt: options.prompt,
+          keyterms: options.keyterms,
+        };
+        if (this._dictationConnectPromise && matchesDictationConnection(options)) {
+          // Reuse an in-flight warmup: replacing it would discard opening audio.
+          // The token fetch may still be pending, so update its options as well.
+          Object.assign(this._dictationConnectionOptions, sessionOptions);
+          this._dictationStreaming?.updateSession(sessionOptions);
+          await this._dictationConnectPromise;
+        } else if (this._dictationStreaming?.isConnected && matchesDictationConnection(options)) {
+          this._dictationStreaming.updateSession(sessionOptions);
         } else {
-          streaming.updateSession?.({
-            language: options.language,
-            model: options.model,
-            prompt: options.prompt,
-            keyterms: options.keyterms,
-          });
+          const connection = connectDictationStreaming(event, options);
+          recordingStreaming = this._dictationStreaming;
+          await connection;
         }
         return { success: true };
       } catch (err) {
+        if (!this._dictationStreaming || this._dictationStreaming === recordingStreaming) {
+          this._dictationRecordingRequested = false;
+        }
         return streamingStartFailure(err);
       }
     });
@@ -8790,15 +8830,21 @@ class IPCHandlers {
     });
 
     ipcMain.handle("dictation-realtime-stop", async () => {
+      this._dictationRecordingRequested = false;
+      // A stopped token fetch must not be reused by the next start or warmup.
+      this._dictationConnectionOptions = null;
       clearDictationIdleTimer();
-      if (!this._dictationStreaming) {
+      const stoppingStreaming = this._dictationStreaming;
+      if (!stoppingStreaming) {
         return { success: true, text: "" };
       }
-      const result = await this._dictationStreaming.disconnect().catch(() => ({ text: "" }));
-      this._dictationStreaming = null;
-      if (this._dictationPreviewEnabled) {
-        this.windowManager.hideTranscriptionPreview();
-        this._dictationPreviewEnabled = false;
+      const result = await stoppingStreaming.disconnect().catch(() => ({ text: "" }));
+      if (this._dictationStreaming === stoppingStreaming) {
+        this._dictationStreaming = null;
+        if (this._dictationPreviewEnabled) {
+          this.windowManager.hideTranscriptionPreview();
+          this._dictationPreviewEnabled = false;
+        }
       }
       return { success: true, text: result.text || "" };
     });

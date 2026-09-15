@@ -986,3 +986,70 @@ test("updateSession is a no-op when configuration does not change or session is 
 
   streaming.cleanup();
 });
+
+test("connecting sessions use updated hints before session.created", async (t) => {
+  const OpenAIRealtimeStreaming = (await load()).default;
+  const streaming = new OpenAIRealtimeStreaming();
+  t.after(() => streaming.cleanup());
+  const socket = makeFakeSocket(WS.CONNECTING);
+  const connected = streaming.connect({ apiKey: "key", createSocket: async () => socket });
+  await new Promise((resolve) => setImmediate(resolve));
+  streaming.updateSession({ language: "fr-FR", keyterms: ["Bonjour"] });
+  assert.equal(socket.sent.length, 0);
+  socket.readyState = WS.OPEN;
+  socket.emit("message", JSON.stringify({ type: "session.created" }));
+  assert.deepEqual(JSON.parse(socket.sent[0]).session.audio.input.transcription, {
+    model: "gpt-4o-mini-transcribe",
+    language: "fr",
+    prompt: "Bonjour",
+  });
+  socket.emit("message", JSON.stringify({ type: "session.updated" }));
+  await connected;
+});
+
+test("connecting sessions dispatch changed hints before the initial configuration acknowledgement", async (t) => {
+  const OpenAIRealtimeStreaming = (await load()).default;
+  const streaming = new OpenAIRealtimeStreaming();
+  t.after(() => streaming.cleanup());
+  const socket = makeFakeSocket(WS.CONNECTING);
+  const connected = streaming.connect({ apiKey: "key", createSocket: async () => socket });
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.readyState = WS.OPEN;
+  socket.emit("message", JSON.stringify({ type: "session.created" }));
+  streaming.updateSession({ language: "de-DE", keyterms: ["Arzt"] });
+  assert.equal(streaming.isConnected, false);
+  assert.equal(socket.sent.length, 2);
+  assert.deepEqual(JSON.parse(socket.sent[1]).session.audio.input.transcription, {
+    model: "gpt-4o-mini-transcribe",
+    language: "de",
+    prompt: "Arzt",
+  });
+  socket.emit("message", JSON.stringify({ type: "session.updated" }));
+  await connected;
+});
+
+test("opening audio follows configuration dispatch without waiting for its acknowledgement", async (t) => {
+  const OpenAIRealtimeStreaming = (await load()).default;
+  const streaming = new OpenAIRealtimeStreaming();
+  t.after(() => streaming.cleanup());
+  const socket = makeFakeSocket(WS.CONNECTING);
+  const connected = streaming.connect({ apiKey: "key", createSocket: async () => socket });
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.readyState = WS.OPEN;
+  assert.equal(streaming.sendAudio(Buffer.from([1, 2])), false);
+  assert.equal(socket.sent.length, 0, "socket open alone must not release audio");
+  socket.emit("message", JSON.stringify({ type: "session.created" }));
+  assert.equal(streaming.isConnected, false);
+  assert.equal(streaming.sendAudio(Buffer.from([3, 4])), true);
+  const messages = socket.sent.map((raw) => JSON.parse(raw));
+  assert.deepEqual(
+    messages.map((message) => message.type),
+    ["session.update", "input_audio_buffer.append", "input_audio_buffer.append"]
+  );
+  assert.deepEqual(
+    messages.slice(1).map((message) => message.audio),
+    ["AQI=", "AwQ="]
+  );
+  socket.emit("message", JSON.stringify({ type: "session.updated" }));
+  await connected;
+});

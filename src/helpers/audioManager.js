@@ -4329,33 +4329,16 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
       this.streamingProcessor = new AudioWorkletNode(audioContext, "pcm-streaming-processor");
       const provider = this.getStreamingProvider();
-      const providerName = this.getStreamingProviderName();
-      // A warm realtime socket may need replacing before it can accept this recording.
-      let providerReady = !["openai-realtime", "tinfoil-realtime"].includes(providerName);
-      const pendingAudio = [];
-      let pendingAudioBytes = 0;
-      const maxPendingAudioBytes = 3 * 16000 * 2; // Three seconds of capture-rate PCM16.
 
       this.streamingProcessor.port.onmessage = (event) => {
         // The worklet posts its remaining PCM followed by a "flushed" sentinel
         // on stop; the sentinel must not be sent as audio (realtime backends
         // reject the odd-length non-PCM bytes with "Invalid audio data").
         if (!ownsSession() || !this.isStreaming || event.data === "flushed") return;
-        if (!providerReady) {
-          if (pendingAudioBytes + event.data.byteLength <= maxPendingAudioBytes) {
-            pendingAudio.push(event.data);
-            pendingAudioBytes += event.data.byteLength;
-          }
-          return;
-        }
         provider.send(event.data);
       };
 
       this.isStreaming = true;
-      this.streamingSource.connect(this.streamingProcessor);
-
-      const tPipeline = performance.now();
-
       // 3. Register IPC event listeners BEFORE connecting, so no transcript
       //    events are lost during the connect handshake.
       this.streamingFinalText = "";
@@ -4425,11 +4408,9 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       this.isRecording = true;
       this.recordingStartTime = Date.now();
       this.onStateChange?.({ isRecording: true, isProcessing: false, isStreaming: true });
-      await this.beginMicRecovery(stream);
-
-      // 4. Connect WebSocket — audio is already flowing from the pipeline above,
-      //    so Deepgram receives data immediately (no idle timeout).
-      const result = await withSessionRefresh(async () => {
+      // Dispatch start before the first PCM frame so a warm session receives
+      // its language hint first. Capture does not wait for the connection.
+      const connectionPromise = withSessionRefresh(async () => {
         const streamingSettings = getSettings();
         const { useLocalWhisper } = streamingSettings;
         const res = await provider.start(
@@ -4463,6 +4444,9 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         }
         return res;
       });
+      this.streamingSource.connect(this.streamingProcessor);
+      const tPipeline = performance.now();
+      const [result] = await Promise.all([connectionPromise, this.beginMicRecovery(stream)]);
       const tWs = performance.now();
       this._settleStreamingStart();
       if (startWasCancelled()) return false;
@@ -4481,10 +4465,6 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         );
         return this.startRecording();
       }
-
-      providerReady = true;
-      for (const buffer of pendingAudio) provider.send(buffer);
-      pendingAudio.length = 0;
 
       logger.info(
         "Streaming start timing",
