@@ -4329,12 +4329,25 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
       this.streamingProcessor = new AudioWorkletNode(audioContext, "pcm-streaming-processor");
       const provider = this.getStreamingProvider();
+      const providerName = this.getStreamingProviderName();
+      // A warm realtime socket may need replacing before it can accept this recording.
+      let providerReady = !["openai-realtime", "tinfoil-realtime"].includes(providerName);
+      const pendingAudio = [];
+      let pendingAudioBytes = 0;
+      const maxPendingAudioBytes = 3 * 16000 * 2; // Three seconds of capture-rate PCM16.
 
       this.streamingProcessor.port.onmessage = (event) => {
         // The worklet posts its remaining PCM followed by a "flushed" sentinel
         // on stop; the sentinel must not be sent as audio (realtime backends
         // reject the odd-length non-PCM bytes with "Invalid audio data").
         if (!ownsSession() || !this.isStreaming || event.data === "flushed") return;
+        if (!providerReady) {
+          if (pendingAudioBytes + event.data.byteLength <= maxPendingAudioBytes) {
+            pendingAudio.push(event.data);
+            pendingAudioBytes += event.data.byteLength;
+          }
+          return;
+        }
         provider.send(event.data);
       };
 
@@ -4468,6 +4481,10 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         );
         return this.startRecording();
       }
+
+      providerReady = true;
+      for (const buffer of pendingAudio) provider.send(buffer);
+      pendingAudio.length = 0;
 
       logger.info(
         "Streaming start timing",

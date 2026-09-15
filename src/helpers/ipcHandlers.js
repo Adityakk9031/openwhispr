@@ -8763,10 +8763,16 @@ class IPCHandlers {
       try {
         clearDictationIdleTimer();
         this._dictationPreviewEnabled = !!options.preview;
-        if (!this._dictationStreaming?.isConnected) {
+        const streaming = this._dictationStreaming;
+        // Auto is omitted by routing; omitting it in session.update retains the old hint.
+        const resetLanguage =
+          !streaming?.preconfigured &&
+          streaming?.language &&
+          (!options.language || options.language === "auto");
+        if (!streaming?.isConnected || resetLanguage) {
           await connectDictationStreaming(event, options);
         } else {
-          this._dictationStreaming.updateSession?.({
+          streaming.updateSession?.({
             language: options.language,
             model: options.model,
             prompt: options.prompt,
