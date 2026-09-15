@@ -130,6 +130,8 @@ jobs:
         run: npm run build:linux -- --publish never
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+          # Forks and Dependabot get no GH_TOKEN; github.token can't read the private font release.
+          BRAND_FONTS_REQUIRED: ${{ secrets.GH_TOKEN && '1' || '0' }}
           VITE_AUTH_URL: ${{ vars.VITE_AUTH_URL || 'https://auth.openwhispr.com' }}
           VITE_OPENWHISPR_API_URL: ${{ vars.VITE_OPENWHISPR_API_URL }}
           VITE_OPENWHISPR_OAUTH_CALLBACK_URL: ${{ vars.VITE_OPENWHISPR_OAUTH_CALLBACK_URL }}
@@ -294,6 +296,9 @@ jobs:
       - name: Compile macos-fast-paste binary
         run: npm run compile:fast-paste -- --arch ${{ matrix.arch }}
 
+      - name: Test macOS copy and paste keyboard layouts
+        run: node --test test/helpers/macosPasteLayout.test.js
+
       - name: Compile macos-media-remote binary
         run: npm run compile:media-remote -- --arch ${{ matrix.arch }}
 
@@ -371,6 +376,8 @@ jobs:
         env:
           TARGET_ARCH: ${{ matrix.arch }}
           GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+          # Forks and Dependabot get no GH_TOKEN; github.token can't read the private font release.
+          BRAND_FONTS_REQUIRED: ${{ secrets.GH_TOKEN && '1' || '0' }}
           VITE_AUTH_URL: ${{ vars.VITE_AUTH_URL || 'https://auth.openwhispr.com' }}
           VITE_OPENWHISPR_API_URL: ${{ vars.VITE_OPENWHISPR_API_URL }}
           VITE_OPENWHISPR_OAUTH_CALLBACK_URL: ${{ vars.VITE_OPENWHISPR_OAUTH_CALLBACK_URL }}
