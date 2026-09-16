@@ -4508,6 +4508,10 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       };
 
       this.isStreaming = true;
+      this.streamingSource.connect(this.streamingProcessor);
+
+      const tPipeline = performance.now();
+
       // 3. Register IPC event listeners BEFORE connecting, so no transcript
       //    events are lost during the connect handshake.
       this.streamingFinalText = "";
@@ -4577,9 +4581,11 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       this.isRecording = true;
       this.recordingStartTime = Date.now();
       this.onStateChange?.({ isRecording: true, isProcessing: false, isStreaming: true });
-      // Dispatch start before the first PCM frame so a warm session receives
-      // its language hint first. Capture does not wait for the connection.
-      const connectionPromise = withSessionRefresh(async () => {
+      await this.beginMicRecovery(stream);
+
+      // 4. Connect WebSocket — audio is already flowing from the pipeline above,
+      //    so Deepgram receives data immediately (no idle timeout).
+      const result = await withSessionRefresh(async () => {
         const streamingSettings = getSettings();
         const { useLocalWhisper } = streamingSettings;
         const res = await provider.start(
@@ -4613,9 +4619,6 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         }
         return res;
       });
-      this.streamingSource.connect(this.streamingProcessor);
-      const tPipeline = performance.now();
-      const [result] = await Promise.all([connectionPromise, this.beginMicRecovery(stream)]);
       const tWs = performance.now();
       this._settleStreamingStart();
       if (startWasCancelled()) return false;

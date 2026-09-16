@@ -52,22 +52,13 @@ async function createSocketWithTimeout(createSocket, timeoutMs) {
   }
 }
 
-function normalizeLanguage(lang) {
-  if (typeof lang !== "string") return null;
-  const trimmed = lang.trim();
+// Realtime transcription takes ISO-639-1 like the batch endpoint, so a
+// registry code such as "zh-TW" is reduced to its base; "auto" means no pin.
+function normalizeLanguage(language) {
+  if (typeof language !== "string") return null;
+  const trimmed = language.trim().toLowerCase();
   if (!trimmed || trimmed === "auto") return null;
-  return trimmed.split("-")[0].toLowerCase();
-}
-
-function normalizePrompt(prompt, keyterms) {
-  if (typeof prompt === "string" && prompt.trim()) {
-    return prompt.trim();
-  }
-  if (Array.isArray(keyterms) && keyterms.length > 0) {
-    const terms = keyterms.filter((k) => typeof k === "string" && k.trim());
-    if (terms.length > 0) return terms.join(", ");
-  }
-  return null;
+  return trimmed.split("-")[0];
 }
 
 class OpenAIRealtimeStreaming {
@@ -75,7 +66,6 @@ class OpenAIRealtimeStreaming {
     this.ws = null;
     this.isConnected = false;
     this.isConnecting = false;
-    this.sessionConfigurationSent = false;
     this.completedSegments = [];
     this.currentPartial = "";
     this.onPartialTranscript = null;
@@ -103,7 +93,6 @@ class OpenAIRealtimeStreaming {
     this._vadEventCount = 0;
     this.model = "gpt-4o-mini-transcribe";
     this.language = null;
-    this.prompt = null;
     this.inputRate = SAMPLE_RATE;
     this.captureRate = SAMPLE_RATE;
     this.coldStartBuffer = [];
@@ -132,8 +121,6 @@ class OpenAIRealtimeStreaming {
       apiKey,
       model,
       language,
-      prompt,
-      keyterms,
       preconfigured,
       inputRate,
       captureRate,
@@ -145,9 +132,6 @@ class OpenAIRealtimeStreaming {
 
     if (this.isConnected || this.isConnecting) {
       debugLogger.debug(`${this.providerLabel} already connected/connecting`, this._logContext());
-      if (this.isConnected) {
-        this.updateSession({ language, model, prompt, keyterms });
-      }
       return;
     }
 
@@ -156,10 +140,8 @@ class OpenAIRealtimeStreaming {
     if (!this.bufferingAudio) this.beginConnecting();
 
     this.isConnecting = true;
-    this.sessionConfigurationSent = false;
     this.model = model || "gpt-4o-mini-transcribe";
     this.language = normalizeLanguage(language);
-    this.prompt = normalizePrompt(prompt, keyterms);
     this.preconfigured = !!preconfigured;
     this.inputRate = inputRate || SAMPLE_RATE;
     this.captureRate = captureRate || this.inputRate;
@@ -297,14 +279,15 @@ class OpenAIRealtimeStreaming {
                   audio: {
                     input: {
                       format: { type: "audio/pcm", rate: this.inputRate },
-                      transcription: this._buildTranscriptionConfig(),
+                      transcription: this.language
+                        ? { model: this.model, language: this.language }
+                        : { model: this.model },
                       turn_detection: turnDetectionFor(this.model, this.vadThreshold),
                     },
                   },
                 },
               })
             );
-            this.sessionConfigurationSent = true;
           }
           break;
         }
@@ -459,68 +442,6 @@ class OpenAIRealtimeStreaming {
     }
   }
 
-  _buildTranscriptionConfig() {
-    const config = { model: this.model };
-    if (this.language) config.language = this.language;
-    if (this.prompt) config.prompt = this.prompt;
-    return config;
-  }
-
-  updateSession({ language, model, prompt, keyterms } = {}) {
-    if (this.preconfigured) return;
-    let changed = false;
-
-    if (model && model !== this.model) {
-      this.model = model;
-      changed = true;
-    }
-    if (language !== undefined) {
-      const normalizedLang = normalizeLanguage(language);
-      if (normalizedLang !== this.language) {
-        this.language = normalizedLang;
-        changed = true;
-      }
-    }
-    if (prompt !== undefined || keyterms !== undefined) {
-      const normalizedPrompt = normalizePrompt(prompt, keyterms);
-      if (normalizedPrompt !== this.prompt) {
-        this.prompt = normalizedPrompt;
-        changed = true;
-      }
-    }
-
-    if (!changed) return;
-
-    if (
-      this.ws &&
-      this.ws.readyState === WebSocket.OPEN &&
-      (this.isConnected || this.sessionConfigurationSent)
-    ) {
-      debugLogger.debug(
-        `${this.providerLabel} updating session configuration`,
-        this._logContext({
-          model: this.model,
-          language: this.language,
-        })
-      );
-      this.ws.send(
-        JSON.stringify({
-          type: "session.update",
-          session: {
-            type: "transcription",
-            audio: {
-              input: {
-                format: { type: "audio/pcm", rate: this.inputRate },
-                transcription: this._buildTranscriptionConfig(),
-                turn_detection: turnDetectionFor(this.model, this.vadThreshold),
-              },
-            },
-          },
-        })
-      );
-    }
-  }
-
   _markConnected() {
     this.isConnected = true;
     this.isConnecting = false;
@@ -621,11 +542,8 @@ class OpenAIRealtimeStreaming {
 
   sendAudio(pcmBuffer) {
     const isOpen = this.ws?.readyState === WebSocket.OPEN;
-    // Ordering the configuration before PCM needs no session.updated round trip.
-    const waitingForConfiguration =
-      this.isConnecting && !this.preconfigured && !this.sessionConfigurationSent;
 
-    if (!isOpen || waitingForConfiguration) {
+    if (!isOpen) {
       if (this.bufferingAudio && this.coldStartBufferSize < COLD_START_BUFFER_MAX) {
         const copy = Buffer.from(pcmBuffer);
         this.coldStartBuffer.push(copy);
@@ -758,9 +676,9 @@ class OpenAIRealtimeStreaming {
 
     this.isConnected = false;
     this.isConnecting = false;
-    this.sessionConfigurationSent = false;
     this.bufferingAudio = false;
   }
 }
 
 module.exports = OpenAIRealtimeStreaming;
+module.exports.normalizeLanguage = normalizeLanguage;
