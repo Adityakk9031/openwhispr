@@ -45,7 +45,7 @@ const electronStub = {
   MessageChannelMain: class {},
 };
 
-const calls = { connects: [], disconnects: [], tokens: [] };
+const calls = { connects: [], disconnects: [], tokens: [], audio: [], sent: [], instances: [] };
 let nextInstance = 0;
 
 class FakeRealtimeStreaming {
@@ -53,6 +53,7 @@ class FakeRealtimeStreaming {
     this.id = ++nextInstance;
     this.isConnected = false;
     this.options = null;
+    calls.instances.push(this);
   }
   beginConnecting() {}
   async connect(options) {
@@ -60,12 +61,13 @@ class FakeRealtimeStreaming {
     this.isConnected = true;
     calls.connects.push({ id: this.id, options });
   }
-  async disconnect() {
+  async disconnect({ commit = true } = {}) {
     this.isConnected = false;
-    calls.disconnects.push(this.id);
+    calls.disconnects.push({ id: this.id, commit });
     return { text: "" };
   }
   sendAudio() {
+    calls.audio.push(this.id);
     return true;
   }
 }
@@ -104,9 +106,7 @@ function anything() {
 }
 
 function scenario(t) {
-  calls.connects.length = 0;
-  calls.disconnects.length = 0;
-  calls.tokens.length = 0;
+  for (const record of Object.values(calls)) record.length = 0;
   // Seed the constructor's dictation fields: the proxy's catch-all would make
   // `this._dictationStreaming?.isConnected` truthy on a cold start.
   const target = {
@@ -122,10 +122,11 @@ function scenario(t) {
       get: (value, property) => (property in value ? value[property] : anything()),
     })
   );
-  const event = { sender: { send() {} } };
+  const event = { sender: { send: (channel, payload) => calls.sent.push({ channel, payload }) } };
   const invoke = (channel, options) => handlers.get(channel)(event, options);
+  const sendAudio = () => listeners.get("dictation-realtime-send")(event, new Uint8Array(4));
   t.after(() => invoke("dictation-realtime-stop"));
-  return { invoke };
+  return { invoke, sendAudio };
 }
 
 const byok = (overrides) => ({
@@ -145,7 +146,7 @@ test("a cold BYOK start passes the dictation language to the realtime session", 
   assert.equal(calls.connects[0].options.preconfigured, false);
 });
 
-test("a cloud start sends the language and model with the token request", async (t) => {
+test("a cloud start sends the language with the token request and leaves the model to the server", async (t) => {
   const s = scenario(t);
   await s.invoke(
     "dictation-realtime-start",
@@ -154,7 +155,9 @@ test("a cloud start sends the language and model with the token request", async 
   assert.equal(calls.tokens.length, 1);
   assert.equal(calls.tokens[0].provider, "openai-realtime");
   assert.equal(calls.tokens[0].options.language, "de");
-  assert.equal(calls.tokens[0].options.model, "gpt-4o-transcribe");
+  // The server owns the managed dictation model; a stale non-OpenAI id in
+  // settings must not reach the client-secret request.
+  assert.equal("model" in calls.tokens[0].options, false);
   assert.equal(calls.connects[0].options.preconfigured, true);
 });
 
@@ -188,9 +191,34 @@ test("a start redials when the warm connection was minted for another language",
   await s.invoke("dictation-realtime-warmup", byok({ language: "de" }));
   await s.invoke("dictation-realtime-start", byok({ language: undefined }));
   assert.equal(calls.connects.length, 2, "warm German session cannot serve an Auto dictation");
-  assert.deepEqual(calls.disconnects, [calls.connects[0].id]);
+  assert.deepEqual(calls.disconnects, [{ id: calls.connects[0].id, commit: false }]);
   assert.equal("language" in calls.connects[1].options, true);
   assert.equal(calls.connects[1].options.language, undefined);
+});
+
+// The renderer streams worklet frames before dictation-realtime-start arrives,
+// so a redial happens with audio already in flight: those frames belong to the
+// new session, and the retiring one must not be committed (its head would come
+// back as a wrong-language final) or waited on.
+test("frames sent during a mismatch redial buffer into the new session, not the retiring one", async (t) => {
+  const s = scenario(t);
+  await s.invoke("dictation-realtime-warmup", byok({ language: "en" }));
+  const started = s.invoke("dictation-realtime-start", byok({ language: "de" }));
+  s.sendAudio();
+  await started;
+  const [warm, fresh] = calls.instances;
+  assert.deepEqual(calls.audio, [fresh.id]);
+  assert.deepEqual(calls.disconnects, [{ id: warm.id, commit: false }]);
+});
+
+test("a retiring warm session's late events never reach the renderer", async (t) => {
+  const s = scenario(t);
+  await s.invoke("dictation-realtime-warmup", byok({ language: "en" }));
+  await s.invoke("dictation-realtime-start", byok({ language: "de" }));
+  const [warm] = calls.instances;
+  warm.onFinalTranscript?.("hello");
+  warm.onError?.(new Error("closed"));
+  assert.deepEqual(calls.sent, []);
 });
 
 test("a start redials when the warm connection was minted for another model", async (t) => {
