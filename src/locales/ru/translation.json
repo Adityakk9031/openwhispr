@@ -984,7 +984,8 @@
       },
       "pasteFailed": {
         "title": "Не удалось вставить автоматически"
-      }
+      },
+      "interruptedRecordingRecovered": "Восстановлено: OpenWhispr закрылся до завершения этой диктовки."
     },
     "clipboard": {
       "pasteFailed": {

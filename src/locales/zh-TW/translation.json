@@ -984,7 +984,8 @@
       },
       "pasteFailed": {
         "title": "無法自動貼上"
-      }
+      },
+      "interruptedRecordingRecovered": "OpenWhispr 在本次語音輸入完成前關閉，已復原此錄音。"
     },
     "clipboard": {
       "pasteFailed": {

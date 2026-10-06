@@ -984,7 +984,8 @@
       },
       "pasteFailed": {
         "title": "Collage automatique impossible"
-      }
+      },
+      "interruptedRecordingRecovered": "Récupérée après la fermeture d'OpenWhispr avant la fin de cette dictée."
     },
     "clipboard": {
       "pasteFailed": {

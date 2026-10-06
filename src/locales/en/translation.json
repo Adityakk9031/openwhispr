@@ -984,7 +984,8 @@
       },
       "pasteFailed": {
         "title": "Couldn't paste automatically"
-      }
+      },
+      "interruptedRecordingRecovered": "Recovered after OpenWhispr closed before this dictation finished."
     },
     "clipboard": {
       "pasteFailed": {

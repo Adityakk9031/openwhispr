@@ -984,7 +984,8 @@
       },
       "pasteFailed": {
         "title": "自動貼り付けに失敗しました"
-      }
+      },
+      "interruptedRecordingRecovered": "このディクテーションの完了前に OpenWhispr が終了したため、録音を復元しました。"
     },
     "clipboard": {
       "pasteFailed": {
