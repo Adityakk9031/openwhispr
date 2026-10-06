@@ -6,7 +6,27 @@ const debugLogger = require("./debugLogger");
 const { buildNoteSearchQuery } = require("./noteSearch");
 const { normalizeStoredSpeakerCount } = require("./speakerCount");
 const { parseEventTime } = require("./calendarAvailability");
-const { ANALYTICS_COUNTER_VERSION, summarizeAnalyticsDays } = require("./analytics");
+// An explicit zone marks an instant this app captured at dictation time. A
+// naive timestamp may instead be a sync artifact: upsertTranscriptionFromCloud
+// keeps the cloud created_at but lets timestamp default to the local pull, so
+// a naive value must never outrank created_at when dating a historical row.
+const { hasExplicitTimeZone, parseDbTimestamp, toDbTimestamp } = require("./dbTimestamp");
+const {
+  BUILTIN_ACTIONS,
+  DETAILED_NOTES_KEY,
+  GENERATE_NOTES_KEY,
+  NOTE_ACTION_LIMITS,
+} = require("./builtinActions");
+const { normalizeSections } = require("./templatePrompts");
+const {
+  ANALYTICS_COUNTER_VERSION,
+  ANALYTICS_HISTORY_BACKFILL_VERSION,
+  ANALYTICS_HISTORICAL_COUNTER_VERSION,
+  countSpokenWords,
+  inferHistoricalAnalyticsMode,
+  localDateKey,
+  summarizeAnalyticsDays,
+} = require("./analytics");
 const { app } = require("electron");
 
 // Server-enforced trigger cap (openwhispr-api); enforced here so one oversized
@@ -22,6 +42,7 @@ const NOTE_CREATE_ACK_FIELDS = [
   "content",
   "enhanced_content",
   "enhancement_prompt",
+  "enhancement_template_id",
   "enhanced_at_content_hash",
   "note_type",
   "source_file",
@@ -53,6 +74,54 @@ const FOLDER_ACK_FIELDS = [
   "deleted_at",
   "left_team",
 ];
+
+// Validates and normalizes the editable fields of a note template or action.
+function resolveActionFields(kind, fields) {
+  const name = (fields.name || "").trim();
+  const description = (fields.description || "").trim();
+  const prompt = (fields.prompt || "").trim();
+  const sections = kind === "template" ? normalizeSections(fields.sections) : [];
+  const output = kind === "action" ? fields.output || "chat" : null;
+  if (!name) return { error: "Name is required" };
+  if (kind === "action" && !prompt) return { error: "Action prompt is required" };
+  if (kind === "template" && !prompt && sections.length === 0) {
+    return { error: "A template needs instructions or a section" };
+  }
+  if (output !== null && output !== "summary" && output !== "chat") {
+    return { error: "Unknown action output" };
+  }
+  const limits = NOTE_ACTION_LIMITS;
+  if (
+    name.length > limits.name ||
+    description.length > limits.description ||
+    prompt.length > limits.prompt ||
+    sections.length > limits.sections ||
+    sections.some(
+      (section) =>
+        section.heading.length > limits.heading || section.instruction.length > limits.instruction
+    )
+  ) {
+    return { error: "Too long" };
+  }
+  return {
+    name,
+    description,
+    prompt,
+    sections: sections.length > 0 ? JSON.stringify(sections) : null,
+    output,
+  };
+}
+
+function toActionItem(row) {
+  if (!row) return null;
+  let sections = null;
+  try {
+    sections = row.sections ? JSON.parse(row.sections) : null;
+  } catch {
+    sections = null;
+  }
+  return { ...row, sections };
+}
 
 function rowMatchesSnapshot(row, snapshot, fields) {
   return fields.every((field) => {
@@ -109,6 +178,12 @@ const SELECTED_CALENDAR_EVENT_FILTER = `(
     SELECT 1 FROM apple_calendars WHERE apple_calendars.id = calendar_events.calendar_id
   ))
 )`;
+
+// A contacts row's source: "google:<account email>", "microsoft:<account
+// email>", "apple", or "manual" (added by hand to a note).
+function contactSource(provider, accountEmail = null) {
+  return accountEmail ? `${provider}:${accountEmail}` : provider;
+}
 
 class DatabaseManager {
   constructor() {
@@ -321,6 +396,11 @@ class DatabaseManager {
         if (!err.message.includes("duplicate column")) throw err;
       }
       try {
+        this.db.exec("ALTER TABLE notes ADD COLUMN enhancement_template_id TEXT");
+      } catch (err) {
+        if (!err.message.includes("duplicate column")) throw err;
+      }
+      try {
         this.db.exec("ALTER TABLE notes ADD COLUMN cloud_id TEXT");
       } catch (err) {
         if (!err.message.includes("duplicate column")) throw err;
@@ -448,6 +528,20 @@ class DatabaseManager {
       } catch (err) {
         if (!err.message.includes("duplicate column")) throw err;
       }
+      // Every row before these columns rewrote the AI summary from the note's
+      // material, which is what a template does, so 'template' is the default.
+      for (const column of [
+        "client_id TEXT",
+        "kind TEXT NOT NULL DEFAULT 'template'",
+        "sections TEXT",
+        "output TEXT",
+      ]) {
+        try {
+          this.db.exec(`ALTER TABLE actions ADD COLUMN ${column}`);
+        } catch (err) {
+          if (!err.message.includes("duplicate column")) throw err;
+        }
+      }
 
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS agent_conversations (
@@ -482,6 +576,37 @@ class DatabaseManager {
       } catch (err) {
         if (!err.message.includes("duplicate column")) throw err;
       }
+      // Receipts for agent connector actions. Never holds message content:
+      // destination labels, states and result links only.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS connector_actions (
+          id TEXT PRIMARY KEY,
+          account_id TEXT,
+          connector TEXT NOT NULL,
+          action TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          destination_label TEXT,
+          state TEXT NOT NULL,
+          result_url TEXT,
+          error_code TEXT,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_connector_actions_connector ON connector_actions(connector, created_at)"
+      );
+      // Destination labels name channels and people in someone's workspace,
+      // so a receipt belongs to the OpenWhispr account that made it. Tables
+      // created before the column existed gain it here.
+      try {
+        this.db.exec("ALTER TABLE connector_actions ADD COLUMN account_id TEXT");
+      } catch (err) {
+        if (!err.message.includes("duplicate column")) throw err;
+      }
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_connector_actions_account ON connector_actions(account_id, connector, created_at)"
+      );
       try {
         this.db.exec("ALTER TABLE agent_conversations ADD COLUMN cloud_id TEXT");
       } catch (err) {
@@ -509,33 +634,85 @@ class DatabaseManager {
         "CREATE INDEX IF NOT EXISTS idx_agent_conversations_container ON agent_conversations(space_id, folder_id)"
       );
 
-      const actionCount = this.db.prepare("SELECT COUNT(*) as count FROM actions").get();
-      if (actionCount.count === 0) {
-        this.db
-          .prepare(
-            "INSERT INTO actions (name, description, prompt, icon, is_builtin, sort_order, translation_key) VALUES (?, ?, ?, ?, 1, 0, ?)"
-          )
-          .run(
-            "Generate Notes",
-            "Clean up, structure, and enhance your notes",
-            "Transform the provided content into clean, well-structured notes in markdown. Preserve the user's intent and all substantive information. Remove filler, small talk, false starts, and redundant content. For personal notes, improve grammar and structure for readability. For meeting transcripts, extract key discussion points, decisions, action items, and follow-ups.",
-            "sparkles",
-            "notes.actions.builtin.generateNotes"
-          );
-      }
-
-      // Migrate built-in action to "Generate Notes"
+      const builtinKeys = BUILTIN_ACTIONS.map((action) => action.translationKey);
+      // A built-in's client id is its key. An older build renames built-in keys it
+      // doesn't know (below), so after a downgrade and upgrade the key comes back
+      // from the client id instead of the row being seeded a second time.
       this.db
         .prepare(
-          "UPDATE actions SET name = ?, description = ?, prompt = ?, translation_key = ? WHERE is_builtin = 1 AND translation_key != ?"
+          `UPDATE actions SET translation_key = client_id WHERE is_builtin = 1 AND client_id IN (${builtinKeys.map(() => "?").join(", ")}) AND translation_key IS NOT client_id`
         )
-        .run(
-          "Generate Notes",
-          "Clean up, structure, and enhance your notes",
-          "Transform the provided content into clean, well-structured notes in markdown. Preserve the user's intent and all substantive information. Remove filler, small talk, false starts, and redundant content. For personal notes, improve grammar and structure for readability. For meeting transcripts, extract key discussion points, decisions, action items, and follow-ups.",
-          "notes.actions.builtin.generateNotes",
-          "notes.actions.builtin.generateNotes"
+        .run(...builtinKeys);
+
+      // Pre-2026 installs carry one built-in row under an older key: rename it to
+      // Generate Notes so the loop below recognizes and upgrades it.
+      this.db
+        .prepare(
+          `UPDATE actions SET translation_key = ? WHERE is_builtin = 1 AND (translation_key IS NULL OR translation_key NOT IN (${builtinKeys.map(() => "?").join(", ")}))`
+        )
+        .run(GENERATE_NOTES_KEY, ...builtinKeys);
+
+      // Detailed Notes became the default "AI Summary"; a name the user chose stays.
+      this.db
+        .prepare(
+          "UPDATE actions SET name = 'AI Summary' WHERE is_builtin = 1 AND translation_key = ? AND name = 'Detailed Notes'"
+        )
+        .run(DETAILED_NOTES_KEY);
+
+      // Built-ins: insert any that are missing, and roll a new default out to rows
+      // that are still a previous flat default (never a user edit). A built-in's
+      // kind is fixed, so it is settled whatever the prompt; its output is only
+      // filled in, since the user may point an action at the summary instead.
+      const selectBuiltin = this.db.prepare(
+        "SELECT id, prompt, sections FROM actions WHERE is_builtin = 1 AND translation_key = ?"
+      );
+      const insertBuiltin = this.db.prepare(
+        "INSERT INTO actions (name, description, prompt, icon, is_builtin, sort_order, translation_key, client_id, kind, sections, output) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)"
+      );
+      const upgradeBuiltin = this.db.prepare(
+        "UPDATE actions SET description = ?, prompt = ?, sections = ? WHERE id = ?"
+      );
+      const settleBuiltin = this.db.prepare(
+        "UPDATE actions SET client_id = ?, kind = ?, sort_order = ?, output = COALESCE(output, ?) WHERE id = ?"
+      );
+      for (const action of BUILTIN_ACTIONS) {
+        const sections = action.sections ? JSON.stringify(action.sections) : null;
+        const existing = selectBuiltin.get(action.translationKey);
+        if (!existing) {
+          insertBuiltin.run(
+            action.name,
+            action.description,
+            action.prompt,
+            action.icon,
+            action.sortOrder,
+            action.translationKey,
+            action.translationKey,
+            action.kind,
+            sections,
+            action.output
+          );
+          continue;
+        }
+        if (existing.sections === null && action.previousPrompts.includes(existing.prompt)) {
+          upgradeBuiltin.run(action.description, action.prompt, sections, existing.id);
+        }
+        settleBuiltin.run(
+          action.translationKey,
+          action.kind,
+          action.sortOrder,
+          action.output,
+          existing.id
         );
+      }
+
+      const actionsWithoutClientId = this.db
+        .prepare("SELECT id FROM actions WHERE client_id IS NULL")
+        .all();
+      const setActionClientId = this.db.prepare("UPDATE actions SET client_id = ? WHERE id = ?");
+      for (const row of actionsWithoutClientId) setActionClientId.run(randomUUID(), row.id);
+      this.db.exec(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_actions_client_id ON actions(client_id) WHERE client_id IS NOT NULL"
+      );
 
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS google_calendar_tokens (
@@ -618,6 +795,17 @@ class DatabaseManager {
         )
       `);
 
+      try {
+        this.db.exec("ALTER TABLE microsoft_calendar_tokens ADD COLUMN tenant_id TEXT");
+      } catch (err) {
+        if (!err.message.includes("duplicate column")) throw err;
+      }
+      try {
+        this.db.exec("ALTER TABLE microsoft_calendar_tokens ADD COLUMN own_addresses TEXT");
+      } catch (err) {
+        if (!err.message.includes("duplicate column")) throw err;
+      }
+
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS microsoft_calendars (
           id TEXT PRIMARY KEY,
@@ -640,6 +828,18 @@ class DatabaseManager {
           "UPDATE microsoft_calendars SET sync_token = NULL, sync_token_expires_at = NULL"
         );
         this.db.pragma("user_version = 2");
+      }
+
+      // One-time reset (user_version 3): older builds stored rooms without a
+      // resource flag, and incremental syncs never resend unchanged events; a
+      // forced full sync stores them flagged, purges the rooms those builds
+      // wrote to contacts and tags the contacts it sees with their source.
+      if (this.db.pragma("user_version", { simple: true }) < 3) {
+        this.db.exec("UPDATE google_calendars SET sync_token = NULL, sync_token_expires_at = NULL");
+        this.db.exec(
+          "UPDATE microsoft_calendars SET sync_token = NULL, sync_token_expires_at = NULL"
+        );
+        this.db.pragma("user_version = 3");
       }
 
       this.db.exec(`
@@ -689,6 +889,23 @@ class DatabaseManager {
         this.db
           .prepare("UPDATE microsoft_calendars SET sync_token = NULL, sync_token_expires_at = NULL")
           .run();
+      }
+
+      // One-time reset (user_version 4): older builds took a shared Google
+      // calendar owner's RSVP as the connected user's; clear those cached
+      // responses and force a full sync of those calendars.
+      if (this.db.pragma("user_version", { simple: true }) < 4) {
+        this.db.exec(`
+          UPDATE calendar_events SET self_response_status = 'unknown'
+          WHERE provider = 'google' AND NOT EXISTS (
+            SELECT 1 FROM google_calendars c
+            WHERE c.id = calendar_events.calendar_id
+              AND (c.is_primary = 1 OR c.id = c.account_email)
+          );
+          UPDATE google_calendars SET sync_token = NULL, sync_token_expires_at = NULL
+          WHERE is_primary = 0 AND (account_email IS NULL OR id != account_email);
+        `);
+        this.db.pragma("user_version = 4");
       }
 
       this.db.exec(`
@@ -741,6 +958,24 @@ class DatabaseManager {
           updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
       `);
+
+      // Every source (see contactSource) that has seen a contact, so a
+      // disconnect only removes people no other source still has. Rows older
+      // builds stored have none.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS contact_sources (
+          email TEXT NOT NULL REFERENCES contacts(email) ON DELETE CASCADE,
+          source TEXT NOT NULL,
+          PRIMARY KEY (email, source)
+        )
+      `);
+      // Pre-release builds kept a single source in contacts.source.
+      if (this.db.pragma("table_info(contacts)").some((column) => column.name === "source")) {
+        this.db.exec(
+          "INSERT OR IGNORE INTO contact_sources (email, source) SELECT email, source FROM contacts WHERE source IS NOT NULL"
+        );
+        this.db.exec("UPDATE contacts SET source = NULL WHERE source IS NOT NULL");
+      }
 
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS speaker_profiles (
@@ -986,6 +1221,12 @@ class DatabaseManager {
           id INTEGER PRIMARY KEY CHECK (id = 1),
           cleared_through TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS analytics_history_backfill_state (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          version INTEGER NOT NULL,
+          scanned_through_transcription_id INTEGER NOT NULL DEFAULT 0
+            CHECK (scanned_through_transcription_id >= 0)
+        );
       `);
       // Repair databases created before analytics deletion tombstones were
       // introduced. SQLite has no ADD COLUMN IF NOT EXISTS syntax.
@@ -1060,6 +1301,13 @@ class DatabaseManager {
       try {
         // JSON array of { id, name, my_role } mirrored from GET /api/me/spaces.
         this.db.exec("ALTER TABLE spaces ADD COLUMN teams TEXT");
+      } catch (err) {
+        if (!err.message.includes("duplicate column")) throw err;
+      }
+      try {
+        // Direct space_members grant ('admin' | 'member'), distinct from the
+        // effective my_role: it decides whether the user can leave the space.
+        this.db.exec("ALTER TABLE spaces ADD COLUMN my_direct_role TEXT");
       } catch (err) {
         if (!err.message.includes("duplicate column")) throw err;
       }
@@ -1239,13 +1487,14 @@ class DatabaseManager {
       }
 
       // Space vector purges owed to Qdrant while the sidecar was down/booting;
-      // drained once the vector index is ready.
+      // drained on the next semantic search activation.
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS pending_vector_purges (
           space_id   INTEGER PRIMARY KEY,
           created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
       `);
+      this._initVectorChangeJournal();
 
       return true;
     } catch (error) {
@@ -1263,14 +1512,26 @@ class DatabaseManager {
       errorCode = null,
       routeKind = null,
       clientTranscriptionId = randomUUID(),
+      analyticsOccurredAt = null,
     } = {}
   ) {
     try {
       if (!this.db) {
         throw new Error("Database not initialized");
       }
+      // With an occurrence time this column carries when the dictation was
+      // spoken rather than when the row was written -- earlier by the length
+      // of the recording plus transcription. History reads it through
+      // normalizeDbDate, which already branches on a trailing zone.
+      // Keep the existing SQLite-friendly separator so mixed old/new rows
+      // continue to sort chronologically, while the trailing Z marks this as
+      // an exact client-captured instant for clear-state reconciliation.
+      const occurredAt = toDbTimestamp(analyticsOccurredAt);
       const stmt = this.db.prepare(
-        "INSERT INTO transcriptions (text, raw_text, status, error_message, error_code, route_kind, client_transcription_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        `INSERT INTO transcriptions (
+           text, raw_text, status, error_message, error_code, route_kind,
+           client_transcription_id, timestamp
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))`
       );
       const result = stmt.run(
         text,
@@ -1279,7 +1540,8 @@ class DatabaseManager {
         errorMessage,
         errorCode,
         routeKind,
-        clientTranscriptionId
+        clientTranscriptionId,
+        occurredAt
       );
 
       const fetchStmt = this.db.prepare("SELECT * FROM transcriptions WHERE id = ?");
@@ -1288,6 +1550,251 @@ class DatabaseManager {
       return { id: result.lastInsertRowid, success: true, transcription };
     } catch (error) {
       debugLogger.error("Error saving transcription", { error: error.message }, "database");
+      throw error;
+    }
+  }
+
+  _ensureAnalyticsHistoryBackfillState(version) {
+    this.db
+      .prepare(
+        `INSERT INTO analytics_history_backfill_state (
+           id, version, scanned_through_transcription_id
+         ) VALUES (1, ?, 0)
+         ON CONFLICT(id) DO UPDATE SET
+           version = excluded.version,
+           scanned_through_transcription_id = 0
+         WHERE analytics_history_backfill_state.version <> excluded.version`
+      )
+      .run(version);
+    return this.db
+      .prepare(
+        `SELECT version, scanned_through_transcription_id
+         FROM analytics_history_backfill_state WHERE id = 1`
+      )
+      .get();
+  }
+
+  getAnalyticsHistoryBackfillState(version = ANALYTICS_HISTORY_BACKFILL_VERSION) {
+    try {
+      if (!this.db) throw new Error("Database not initialized");
+      const safeVersion = Math.max(1, Math.trunc(Number(version)) || 1);
+      return this.db.transaction(() => {
+        const state = this._ensureAnalyticsHistoryBackfillState(safeVersion);
+        const target = this.db
+          .prepare("SELECT COALESCE(MAX(id), 0) AS id FROM transcriptions")
+          .get();
+        return {
+          version: safeVersion,
+          scannedThroughId: Number(state.scanned_through_transcription_id),
+          targetId: Number(target.id),
+        };
+      })();
+    } catch (error) {
+      debugLogger.error(
+        "Error reading analytics history backfill state",
+        { error: error.message },
+        "database"
+      );
+      throw error;
+    }
+  }
+
+  _invalidateAnalyticsHistoryFromTranscription(id) {
+    const resumeBeforeId = Math.max(0, Math.trunc(Number(id)) - 1);
+    this.db
+      .prepare(
+        `INSERT INTO analytics_history_backfill_state (
+           id, version, scanned_through_transcription_id
+         ) VALUES (1, ?, 0)
+         ON CONFLICT(id) DO UPDATE SET
+           version = excluded.version,
+           scanned_through_transcription_id = CASE
+             WHEN analytics_history_backfill_state.version = excluded.version
+             THEN MIN(
+               analytics_history_backfill_state.scanned_through_transcription_id,
+               ?
+             )
+             ELSE 0
+           END`
+      )
+      .run(ANALYTICS_HISTORY_BACKFILL_VERSION, resumeBeforeId);
+  }
+
+  backfillAnalyticsHistoryBatch({
+    afterId = 0,
+    throughId = null,
+    checkpointVersion = null,
+    limit = 250,
+  } = {}) {
+    try {
+      if (!this.db) throw new Error("Database not initialized");
+      const safeLimit = Math.max(1, Math.min(Math.trunc(Number(limit)) || 250, 1_000));
+      const safeAfterId = Math.max(0, Math.trunc(Number(afterId)) || 0);
+      const safeThroughId =
+        throughId === null || throughId === undefined
+          ? null
+          : Math.max(0, Math.trunc(Number(throughId)) || 0);
+      const safeCheckpointVersion =
+        checkpointVersion === null || checkpointVersion === undefined
+          ? null
+          : Math.max(1, Math.trunc(Number(checkpointVersion)) || 1);
+
+      return this.db.transaction(() => {
+        const checkpoint =
+          safeCheckpointVersion === null
+            ? null
+            : this._ensureAnalyticsHistoryBackfillState(safeCheckpointVersion);
+        const effectiveAfterId = checkpoint
+          ? Number(checkpoint.scanned_through_transcription_id)
+          : safeAfterId;
+        if (safeThroughId !== null && effectiveAfterId >= safeThroughId) {
+          return {
+            complete: true,
+            nextCursor: effectiveAfterId,
+            scanned: 0,
+            inserted: 0,
+            skipped: 0,
+          };
+        }
+
+        const clearState = this.db
+          .prepare("SELECT cleared_through FROM analytics_device_clear_state WHERE id = 1")
+          .get();
+        // Legacy SQLite timestamps are completion times without an offset. Once
+        // the user has cleared Insights, only a client-captured occurrence time
+        // can prove that a historical row happened afterward, so an ambiguous
+        // legacy row stays out rather than reviving a cleared counter. That is
+        // the eligibility rule below; the boundary on the instant actually
+        // written is enforced in the loop, where the chosen value is known.
+        const rows = this.db
+          .prepare(
+            `SELECT transcription.id, transcription.client_transcription_id,
+                    transcription.text, transcription.raw_text, transcription.timestamp,
+                    transcription.created_at,
+                    audio_duration_ms, provider, model
+             FROM transcriptions transcription
+             WHERE transcription.id > ?
+               AND (? IS NULL OR transcription.id <= ?)
+               AND transcription.deleted_at IS NULL
+               AND transcription.status = 'completed'
+               AND TRIM(COALESCE(NULLIF(TRIM(transcription.raw_text), ''), transcription.text, '')) != ''
+               AND NOT EXISTS (
+                 SELECT 1 FROM analytics_events event
+                 WHERE event.event_id = TRIM(transcription.client_transcription_id)
+               )
+               AND (
+                 ? IS NULL
+                 OR (
+                   (TRIM(transcription.timestamp) LIKE '%Z'
+                    OR SUBSTR(TRIM(transcription.timestamp), -6, 1) IN ('+', '-'))
+                   AND JULIANDAY(transcription.timestamp) > JULIANDAY(?)
+                 )
+               )
+             ORDER BY transcription.id ASC
+             LIMIT ?`
+          )
+          .all(
+            effectiveAfterId,
+            safeThroughId,
+            safeThroughId,
+            clearState?.cleared_through ?? null,
+            clearState?.cleared_through ?? null,
+            safeLimit
+          );
+
+        let inserted = 0;
+        let skipped = 0;
+        const clearedThrough = clearState ? Date.parse(clearState.cleared_through) : null;
+        const insert = this.db.prepare(
+          `INSERT INTO analytics_events (
+             event_id, account_id, occurred_at, local_date, word_count,
+             spoken_duration_ms, mode, provider, model, counter_version, created_at
+           ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, DATETIME(?))
+           ON CONFLICT(event_id) DO NOTHING`
+        );
+        const assignClientId = this.db.prepare(
+          `UPDATE transcriptions SET client_transcription_id = ?
+           WHERE id = ? AND (client_transcription_id IS NULL OR TRIM(client_transcription_id) = '')`
+        );
+
+        for (const row of rows) {
+          const sourceText = row.raw_text?.trim() ? row.raw_text : row.text;
+          const wordCount = countSpokenWords(sourceText);
+          if (wordCount === 0) {
+            skipped += 1;
+            continue;
+          }
+
+          const createdAt = parseDbTimestamp(row.created_at);
+          // A naive timestamp can be a sync artifact rather than an occurrence
+          // time, so it is never the answer: created_at carries the cloud row's
+          // own instant, while timestamp defaulted to the moment of the pull.
+          const occurredAt =
+            (hasExplicitTimeZone(row.timestamp) ? parseDbTimestamp(row.timestamp) : null) ??
+            createdAt;
+          // Guessing a date would put an old dictation on today, inflating
+          // today's counters and manufacturing a current streak out of a row
+          // whose age we could not read. It stays out instead.
+          if (!occurredAt) {
+            skipped += 1;
+            continue;
+          }
+          // Not a restatement of the query's clear filter: that one decides
+          // eligibility from transcription.timestamp, while this guards the
+          // instant actually chosen, which may be created_at. It also catches
+          // what the SQL shape test cannot -- a bare YYYY-MM-DD reads as zoned
+          // there, its day hyphen sitting six characters from the end.
+          if (clearedThrough !== null && occurredAt.getTime() <= clearedThrough) {
+            skipped += 1;
+            continue;
+          }
+
+          const eventId = row.client_transcription_id?.trim() || randomUUID();
+          if (!row.client_transcription_id?.trim()) assignClientId.run(eventId, row.id);
+          const result = insert.run(
+            eventId,
+            occurredAt.toISOString(),
+            localDateKey(occurredAt),
+            wordCount,
+            Number(row.audio_duration_ms) > 0 ? Number(row.audio_duration_ms) : null,
+            inferHistoricalAnalyticsMode(row.provider),
+            row.provider || null,
+            row.model || null,
+            ANALYTICS_HISTORICAL_COUNTER_VERSION,
+            (createdAt ?? occurredAt).toISOString()
+          );
+          if (result.changes > 0) inserted += 1;
+          else skipped += 1;
+        }
+
+        const complete = rows.length < safeLimit;
+        const lastCandidateId =
+          rows.length > 0 ? Number(rows[rows.length - 1].id) : effectiveAfterId;
+        const nextCursor = complete && safeThroughId !== null ? safeThroughId : lastCandidateId;
+        if (checkpoint) {
+          this.db
+            .prepare(
+              `UPDATE analytics_history_backfill_state
+               SET scanned_through_transcription_id = ?
+               WHERE id = 1 AND version = ?`
+            )
+            .run(nextCursor, safeCheckpointVersion);
+        }
+
+        return {
+          complete,
+          nextCursor,
+          scanned: rows.length,
+          inserted,
+          skipped,
+        };
+      })();
+    } catch (error) {
+      debugLogger.error(
+        "Error backfilling analytics history",
+        { error: error.message },
+        "database"
+      );
       throw error;
     }
   }
@@ -1383,34 +1890,47 @@ class DatabaseManager {
     }
   }
 
-  getPendingAnalyticsEvents(limit = 200) {
+  analyticsAccountId(expectedAccountId) {
+    if (expectedAccountId == null) return this.activeAccountId;
+    if (expectedAccountId !== this.activeAccountId) {
+      throw Object.assign(new Error("Analytics account context changed"), {
+        code: "AUTH_CONTEXT_CHANGED",
+      });
+    }
+    return expectedAccountId;
+  }
+
+  getPendingAnalyticsEvents(limit = 200, expectedAccountId) {
     try {
       if (!this.db) throw new Error("Database not initialized");
-      if (!this.activeAccountId) return [];
+      const accountId = this.analyticsAccountId(expectedAccountId);
+      if (!accountId) return [];
       const safeLimit = Math.max(1, Math.min(Number(limit) || 200, 200));
       // The projection is the wire shape: AnalyticsService posts these rows
       // verbatim, so every column here has to satisfy the batch endpoint's
       // event schema -- occurred_at included, which that schema requires
-      // alongside local_date. It also orders the batch, oldest dictation first.
+      // alongside local_date. Exact events go first so rejected historical
+      // rows cannot block current activity during an API rollback.
       return this.db
         .prepare(
           `SELECT event_id, occurred_at, local_date, word_count, spoken_duration_ms,
                   mode, provider, model, counter_version
            FROM analytics_events
            WHERE account_id = ? AND sync_status = 'pending' AND deleted_at IS NULL
-           ORDER BY occurred_at ASC LIMIT ?`
+           ORDER BY (counter_version = 0) ASC, occurred_at ASC LIMIT ?`
         )
-        .all(this.activeAccountId, safeLimit);
+        .all(accountId, safeLimit);
     } catch (error) {
       debugLogger.error("Error reading pending analytics", { error: error.message }, "database");
       throw error;
     }
   }
 
-  markAnalyticsEventsSynced(eventIds) {
+  markAnalyticsEventsSynced(eventIds, expectedAccountId) {
     try {
       if (!this.db) throw new Error("Database not initialized");
-      if (!this.activeAccountId || !Array.isArray(eventIds) || eventIds.length === 0) {
+      const accountId = this.analyticsAccountId(expectedAccountId);
+      if (!accountId || !Array.isArray(eventIds) || eventIds.length === 0) {
         return { success: true, updated: 0 };
       }
       const placeholders = eventIds.map(() => "?").join(", ");
@@ -1420,7 +1940,7 @@ class DatabaseManager {
            WHERE account_id = ? AND deleted_at IS NULL
              AND event_id IN (${placeholders})`
         )
-        .run(this.activeAccountId, ...eventIds);
+        .run(accountId, ...eventIds);
       return { success: true, updated: result.changes };
     } catch (error) {
       debugLogger.error("Error marking analytics synced", { error: error.message }, "database");
@@ -1428,10 +1948,11 @@ class DatabaseManager {
     }
   }
 
-  getPendingAnalyticsDeletes(limit = 200) {
+  getPendingAnalyticsDeletes(limit = 200, expectedAccountId) {
     try {
       if (!this.db) throw new Error("Database not initialized");
-      if (!this.activeAccountId) return [];
+      const accountId = this.analyticsAccountId(expectedAccountId);
+      if (!accountId) return [];
       const safeLimit = Math.max(1, Math.min(Number(limit) || 200, 200));
       return this.db
         .prepare(
@@ -1439,7 +1960,7 @@ class DatabaseManager {
            WHERE account_id = ? AND deleted_at IS NOT NULL AND sync_status = 'pending'
            ORDER BY occurred_at ASC LIMIT ?`
         )
-        .all(this.activeAccountId, safeLimit);
+        .all(accountId, safeLimit);
     } catch (error) {
       debugLogger.error(
         "Error reading pending analytics deletes",
@@ -1450,10 +1971,11 @@ class DatabaseManager {
     }
   }
 
-  hardDeleteAnalyticsEvents(eventIds) {
+  hardDeleteAnalyticsEvents(eventIds, expectedAccountId) {
     try {
       if (!this.db) throw new Error("Database not initialized");
-      if (!this.activeAccountId || !Array.isArray(eventIds) || eventIds.length === 0) {
+      const accountId = this.analyticsAccountId(expectedAccountId);
+      if (!accountId || !Array.isArray(eventIds) || eventIds.length === 0) {
         return { success: true, deleted: 0 };
       }
       const placeholders = eventIds.map(() => "?").join(", ");
@@ -1463,7 +1985,7 @@ class DatabaseManager {
            WHERE account_id = ? AND deleted_at IS NOT NULL
              AND event_id IN (${placeholders})`
         )
-        .run(this.activeAccountId, ...eventIds);
+        .run(accountId, ...eventIds);
       return { success: true, deleted: result.changes };
     } catch (error) {
       debugLogger.error(
@@ -1475,22 +1997,24 @@ class DatabaseManager {
     }
   }
 
-  getPendingAnalyticsClear() {
+  getPendingAnalyticsClear(expectedAccountId) {
     if (!this.db) throw new Error("Database not initialized");
-    if (!this.activeAccountId) return null;
+    const accountId = this.analyticsAccountId(expectedAccountId);
+    if (!accountId) return null;
     return (
       this.db
         .prepare(
           `SELECT cleared_through FROM analytics_clear_requests
            WHERE account_id = ? AND synced = 0`
         )
-        .get(this.activeAccountId) ?? null
+        .get(accountId) ?? null
     );
   }
 
-  completeAnalyticsClear(clearedThrough) {
+  completeAnalyticsClear(clearedThrough, expectedAccountId) {
     if (!this.db) throw new Error("Database not initialized");
-    if (!this.activeAccountId || typeof clearedThrough !== "string") {
+    const accountId = this.analyticsAccountId(expectedAccountId);
+    if (!accountId || typeof clearedThrough !== "string") {
       return { success: false, deleted: 0 };
     }
 
@@ -1500,14 +2024,14 @@ class DatabaseManager {
           `UPDATE analytics_clear_requests SET synced = 1
            WHERE account_id = ? AND cleared_through = ? AND synced = 0`
         )
-        .run(this.activeAccountId, clearedThrough);
+        .run(accountId, clearedThrough);
       if (request.changes === 0) return 0;
       return this.db
         .prepare(
           `DELETE FROM analytics_events
            WHERE account_id = ? AND occurred_at <= ?`
         )
-        .run(this.activeAccountId, clearedThrough).changes;
+        .run(accountId, clearedThrough).changes;
     });
     return { success: true, deleted: complete() };
   }
@@ -1529,28 +2053,35 @@ class DatabaseManager {
   // user who had been signed in for months had nothing "unclaimed" — the
   // consent prompt never opened, and flipping the toggle uploaded their entire
   // history in one pass.
-  countAnalyticsEventsAwaitingUpload() {
+  countAnalyticsEventsAwaitingUpload(expectedAccountId) {
     if (!this.db) throw new Error("Database not initialized");
+    const accountId = this.analyticsAccountId(expectedAccountId);
     return this.db
       .prepare(
         `SELECT COUNT(*) AS count FROM analytics_events
          WHERE deleted_at IS NULL AND sync_status <> 'synced'
            AND (account_id IS NULL OR account_id = ?)`
       )
-      .get(this.activeAccountId).count;
+      .get(accountId).count;
   }
 
   // Device-local rows stay unattributed until the signed-in user explicitly
   // asks for them, so signing in never silently adopts someone else's history.
-  claimAnonymousAnalyticsEvents() {
+  claimAnonymousAnalyticsEvents(expectedAccountId) {
     try {
       if (!this.db) throw new Error("Database not initialized");
-      if (!this.activeAccountId) return { success: false, claimed: 0 };
+      const accountId =
+        typeof expectedAccountId === "string" && expectedAccountId.trim().length > 0
+          ? expectedAccountId.trim()
+          : null;
+      if (!accountId || accountId !== this.activeAccountId) {
+        return { success: false, claimed: 0 };
+      }
       const result = this.db
         .prepare(
           "UPDATE analytics_events SET account_id = ? WHERE account_id IS NULL AND deleted_at IS NULL"
         )
-        .run(this.activeAccountId);
+        .run(accountId);
       return { success: true, claimed: result.changes };
     } catch (error) {
       debugLogger.error("Error claiming analytics events", { error: error.message }, "database");
@@ -1749,7 +2280,15 @@ class DatabaseManager {
     try {
       if (!this.db) throw new Error("Database not initialized");
       const stmt = this.db.prepare("UPDATE transcriptions SET text = ?, raw_text = ? WHERE id = ?");
-      stmt.run(text, rawText, id);
+      this.db.transaction(() => {
+        const existing = this.db
+          .prepare("SELECT text, raw_text FROM transcriptions WHERE id = ?")
+          .get(id);
+        if (existing && (existing.text !== text || existing.raw_text !== rawText)) {
+          this._invalidateAnalyticsHistoryFromTranscription(id);
+        }
+        stmt.run(text, rawText, id);
+      })();
       return { success: true };
     } catch (error) {
       debugLogger.error("Error updating transcription text", { error: error.message }, "database");
@@ -1763,7 +2302,13 @@ class DatabaseManager {
       const stmt = this.db.prepare(
         "UPDATE transcriptions SET status = ?, error_message = ?, error_code = ? WHERE id = ?"
       );
-      stmt.run(status, errorMessage, errorCode, id);
+      this.db.transaction(() => {
+        const existing = this.db.prepare("SELECT status FROM transcriptions WHERE id = ?").get(id);
+        if (existing && existing.status !== status && status === "completed") {
+          this._invalidateAnalyticsHistoryFromTranscription(id);
+        }
+        stmt.run(status, errorMessage, errorCode, id);
+      })();
       return { success: true };
     } catch (error) {
       debugLogger.error(
@@ -2775,6 +3320,7 @@ class DatabaseManager {
         "content",
         "enhanced_content",
         "enhancement_prompt",
+        "enhancement_template_id",
         "enhanced_at_content_hash",
         "folder_id",
         "space_id",
@@ -2969,6 +3515,7 @@ class DatabaseManager {
       }
       this.db.prepare("DELETE FROM analytics_events WHERE account_id = ?").run(accountId);
       this.db.prepare("DELETE FROM analytics_clear_requests WHERE account_id = ?").run(accountId);
+      this.db.prepare("DELETE FROM connector_actions WHERE account_id = ?").run(accountId);
       this.db.prepare("DELETE FROM space_accounts WHERE account_id = ?").run(accountId);
     };
 
@@ -3364,7 +3911,8 @@ class DatabaseManager {
         this.db
           .prepare(
             `UPDATE spaces SET cloud_space_id = ?, workspace_id = ?, name = ?, emoji = ?, my_role = ?,
-               member_count = ?, teams = ?, deleted_at = NULL, updated_at = ? WHERE id = ?`
+               my_direct_role = ?, member_count = ?, teams = ?, deleted_at = NULL, updated_at = ?
+             WHERE id = ?`
           )
           .run(
             space.id,
@@ -3372,6 +3920,7 @@ class DatabaseManager {
             space.name,
             space.emoji ?? null,
             space.my_role ?? null,
+            space.my_direct_role ?? null,
             space.member_count ?? null,
             teamsJson,
             updatedAt,
@@ -3391,8 +3940,9 @@ class DatabaseManager {
       const result = this.db
         .prepare(
           `INSERT INTO spaces (client_space_id, cloud_space_id, workspace_id, kind, name, emoji,
-             sort_order, my_role, member_count, teams, sync_status, created_at, updated_at)
-           VALUES (?, ?, ?, 'team', ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+             sort_order, my_role, my_direct_role, member_count, teams, sync_status, created_at,
+             updated_at)
+           VALUES (?, ?, ?, 'team', ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
         )
         .run(
           randomUUID(),
@@ -3402,6 +3952,7 @@ class DatabaseManager {
           space.emoji ?? null,
           (maxOrder?.max_order ?? 0) + 1,
           space.my_role ?? null,
+          space.my_direct_role ?? null,
           space.member_count ?? null,
           teamsJson,
           space.created_at || updatedAt,
@@ -3614,6 +4165,76 @@ class DatabaseManager {
     }
   }
 
+  _initVectorChangeJournal() {
+    this.db.transaction(() => {
+      const journalExists = this.db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pending_vector_changes'"
+        )
+        .get();
+      // AUTOINCREMENT keeps acknowledgements unique even after the queue is
+      // emptied or a deleted note id is reused while indexing is in flight.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS pending_vector_changes (
+          revision INTEGER PRIMARY KEY AUTOINCREMENT,
+          note_id INTEGER NOT NULL UNIQUE
+        );
+        CREATE TRIGGER IF NOT EXISTS notes_vector_insert AFTER INSERT ON notes BEGIN
+          INSERT INTO pending_vector_changes (note_id) VALUES (NEW.id)
+          ON CONFLICT(note_id) DO UPDATE SET revision = excluded.revision;
+        END;
+        CREATE TRIGGER IF NOT EXISTS notes_vector_update
+        AFTER UPDATE OF title, content, enhanced_content, space_id, folder_id, deleted_at ON notes
+        WHEN OLD.title IS NOT NEW.title OR OLD.content IS NOT NEW.content
+          OR OLD.enhanced_content IS NOT NEW.enhanced_content
+          OR OLD.space_id IS NOT NEW.space_id OR OLD.folder_id IS NOT NEW.folder_id
+          OR OLD.deleted_at IS NOT NEW.deleted_at
+        BEGIN
+          INSERT INTO pending_vector_changes (note_id) VALUES (NEW.id)
+          ON CONFLICT(note_id) DO UPDATE SET revision = excluded.revision;
+        END;
+        CREATE TRIGGER IF NOT EXISTS notes_vector_delete AFTER DELETE ON notes BEGIN
+          INSERT INTO pending_vector_changes (note_id) VALUES (OLD.id)
+          ON CONFLICT(note_id) DO UPDATE SET revision = excluded.revision;
+        END;
+      `);
+      if (!journalExists) this.enqueueAllVectorChanges();
+    })();
+  }
+
+  getPendingVectorChanges(limit = 50, afterRevision = 0) {
+    if (!this.db) throw new Error("Database not initialized");
+    return this.db
+      .prepare(
+        "SELECT note_id, revision FROM pending_vector_changes WHERE revision > ? ORDER BY revision LIMIT ?"
+      )
+      .all(afterRevision, limit);
+  }
+
+  clearPendingVectorChange(noteId, revision) {
+    if (!this.db) throw new Error("Database not initialized");
+    const result = this.db
+      .prepare("DELETE FROM pending_vector_changes WHERE note_id = ? AND revision = ?")
+      .run(noteId, revision);
+    return { success: true, changes: result.changes };
+  }
+
+  enqueueAllVectorChanges() {
+    if (!this.db) throw new Error("Database not initialized");
+    this.db.exec(`
+      INSERT INTO pending_vector_changes (note_id) SELECT id FROM notes WHERE TRUE
+      ON CONFLICT(note_id) DO UPDATE SET revision = excluded.revision
+    `);
+    return { success: true };
+  }
+
+  getNoteForVectorIndex(noteId) {
+    if (!this.db) throw new Error("Database not initialized");
+    // The durable index spans accounts; renderer/search reads still use the
+    // scoped getNote API before exposing any indexed result.
+    return this.db.prepare("SELECT * FROM notes WHERE id = ?").get(noteId) || null;
+  }
+
   addPendingVectorPurge(spaceId) {
     try {
       if (!this.db) throw new Error("Database not initialized");
@@ -3651,7 +4272,10 @@ class DatabaseManager {
   getActions() {
     try {
       if (!this.db) throw new Error("Database not initialized");
-      return this.db.prepare("SELECT * FROM actions ORDER BY sort_order ASC, created_at ASC").all();
+      return this.db
+        .prepare("SELECT * FROM actions ORDER BY sort_order ASC, created_at ASC")
+        .all()
+        .map(toActionItem);
     } catch (error) {
       debugLogger.error("Error getting actions", { error: error.message }, "notes");
       throw error;
@@ -3661,30 +4285,47 @@ class DatabaseManager {
   getAction(id) {
     try {
       if (!this.db) throw new Error("Database not initialized");
-      return this.db.prepare("SELECT * FROM actions WHERE id = ?").get(id) || null;
+      return toActionItem(this.db.prepare("SELECT * FROM actions WHERE id = ?").get(id));
     } catch (error) {
       debugLogger.error("Error getting action", { error: error.message }, "notes");
       throw error;
     }
   }
 
-  createAction(name, description, prompt, icon = "sparkles") {
+  createAction(
+    name,
+    description,
+    prompt,
+    icon = "sparkles",
+    { kind = "template", sections, output } = {}
+  ) {
     try {
       if (!this.db) throw new Error("Database not initialized");
-      const trimmedName = (name || "").trim();
-      const trimmedPrompt = (prompt || "").trim();
-      if (!trimmedName) return { success: false, error: "Action name is required" };
-      if (!trimmedPrompt) return { success: false, error: "Action prompt is required" };
+      if (kind !== "template" && kind !== "action") {
+        return { success: false, error: "Unknown action kind" };
+      }
+      const fields = resolveActionFields(kind, { name, description, prompt, sections, output });
+      if (fields.error) return { success: false, error: fields.error };
       const maxOrder = this.db.prepare("SELECT MAX(sort_order) as max_order FROM actions").get();
       const sortOrder = (maxOrder?.max_order ?? 0) + 1;
       const result = this.db
         .prepare(
-          "INSERT INTO actions (name, description, prompt, icon, sort_order) VALUES (?, ?, ?, ?, ?)"
+          "INSERT INTO actions (name, description, prompt, icon, sort_order, client_id, kind, sections, output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
-        .run(trimmedName, (description || "").trim(), trimmedPrompt, icon || "sparkles", sortOrder);
-      const action = this.db
-        .prepare("SELECT * FROM actions WHERE id = ?")
-        .get(result.lastInsertRowid);
+        .run(
+          fields.name,
+          fields.description,
+          fields.prompt,
+          icon || "sparkles",
+          sortOrder,
+          randomUUID(),
+          kind,
+          fields.sections,
+          fields.output
+        );
+      const action = toActionItem(
+        this.db.prepare("SELECT * FROM actions WHERE id = ?").get(result.lastInsertRowid)
+      );
       return { success: true, action };
     } catch (error) {
       debugLogger.error("Error creating action", { error: error.message }, "notes");
@@ -3692,24 +4333,42 @@ class DatabaseManager {
     }
   }
 
+  // A row's kind and client id never change; every other field is replaced by
+  // the update or kept, then validated as a whole.
   updateAction(id, updates) {
     try {
       if (!this.db) throw new Error("Database not initialized");
-      const allowedFields = ["name", "description", "prompt", "icon", "sort_order"];
-      const fields = [];
-      const values = [];
-      for (const [key, value] of Object.entries(updates)) {
-        if (allowedFields.includes(key) && value !== undefined) {
-          fields.push(`${key} = ?`);
-          values.push(value);
-        }
+      const current = this.getAction(id);
+      if (!current) return { success: false, error: "Action not found" };
+      const merged = { ...current };
+      for (const key of [
+        "name",
+        "description",
+        "prompt",
+        "icon",
+        "sort_order",
+        "sections",
+        "output",
+      ]) {
+        if (updates[key] !== undefined) merged[key] = updates[key];
       }
-      if (fields.length === 0) return { success: false };
-      fields.push("updated_at = CURRENT_TIMESTAMP");
-      values.push(id);
-      this.db.prepare(`UPDATE actions SET ${fields.join(", ")} WHERE id = ?`).run(...values);
-      const action = this.db.prepare("SELECT * FROM actions WHERE id = ?").get(id);
-      return { success: true, action };
+      const fields = resolveActionFields(current.kind, merged);
+      if (fields.error) return { success: false, error: fields.error };
+      this.db
+        .prepare(
+          "UPDATE actions SET name = ?, description = ?, prompt = ?, icon = ?, sort_order = ?, sections = ?, output = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+        )
+        .run(
+          fields.name,
+          fields.description,
+          fields.prompt,
+          merged.icon,
+          merged.sort_order,
+          fields.sections,
+          fields.output,
+          id
+        );
+      return { success: true, action: this.getAction(id) };
     } catch (error) {
       debugLogger.error("Error updating action", { error: error.message }, "notes");
       throw error;
@@ -4042,6 +4701,7 @@ class DatabaseManager {
         }
         this.db.prepare("DELETE FROM google_calendars WHERE account_email = ?").run(email);
         this.db.prepare("DELETE FROM google_calendar_tokens WHERE google_email = ?").run(email);
+        this._removeContactSources("source = ?", contactSource("google", email));
       });
       transaction();
       return { success: true };
@@ -4207,6 +4867,7 @@ class DatabaseManager {
           )
         )
         .all()
+        .filter((event) => event.self_response_status !== "declined")
         .map(stripDedupeColumn);
     } catch (error) {
       debugLogger.error("Error getting active events", { error: error.message }, "gcal");
@@ -4259,6 +4920,7 @@ class DatabaseManager {
           )
         )
         .all(windowMinutes)
+        .filter((event) => event.self_response_status !== "declined")
         .map(stripDedupeColumn);
     } catch (error) {
       debugLogger.error("Error getting upcoming events", { error: error.message }, "gcal");
@@ -4320,21 +4982,206 @@ class DatabaseManager {
     }
   }
 
-  getNoteByCalendarEventId(eventId, excludeNoteId = null) {
+  // accountId is the account the action ran under (resolved from its
+  // credential by the connector IPC), not this.activeAccountId, which lags a
+  // sign-in or account switch.
+  insertConnectorAction({
+    id,
+    accountId = null,
+    connector,
+    action,
+    kind,
+    destinationLabel = null,
+    state,
+    resultUrl = null,
+    errorCode = null,
+  }) {
+    if (!this.db) throw new Error("Database not initialized");
+    this.db
+      .prepare(
+        `INSERT INTO connector_actions
+           (id, account_id, connector, action, kind, destination_label, state, result_url, error_code)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(id, accountId, connector, action, kind, destinationLabel, state, resultUrl, errorCode);
+  }
+
+  // With fromState, only a row still in that state moves, so a caller can tell
+  // a durable transition (1 row) from a missing or already-moved row (0).
+  updateConnectorActionState(
+    id,
+    { state, destinationLabel = null, resultUrl = null, errorCode = null },
+    fromState = null
+  ) {
+    if (!this.db) throw new Error("Database not initialized");
+    const guard = fromState === null ? "" : " AND state = ?";
+    const params = [
+      state,
+      destinationLabel,
+      resultUrl,
+      errorCode,
+      id,
+      ...(fromState === null ? [] : [fromState]),
+    ];
+    return this.db
+      .prepare(
+        `UPDATE connector_actions
+           SET state = ?,
+               destination_label = COALESCE(?, destination_label),
+               result_url = COALESCE(?, result_url),
+               error_code = COALESCE(?, error_code),
+               updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?${guard}`
+      )
+      .run(...params).changes;
+  }
+
+  // Receipts name the people a user wrote to, so only the account that took
+  // the action sees them.
+  listRecentConnectorActions(connector, limit = 10, accountId = null) {
+    if (!this.db) throw new Error("Database not initialized");
+    if (!accountId) return [];
+    return this.db
+      .prepare(
+        `SELECT id, connector, action, kind,
+                destination_label AS destinationLabel, state,
+                result_url AS resultUrl, error_code AS errorCode,
+                created_at AS createdAt
+           FROM connector_actions
+          WHERE connector = ? AND account_id = ?
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT ?`
+      )
+      .all(connector, accountId, limit);
+  }
+
+  // A quit mid-send can't tell whether the provider acted, so committing rows
+  // become unknown; pending rows were never sent. Rows without an account
+  // (only pre-release builds wrote them) are listed to no one and no account
+  // deletion reaches them, so they are deleted.
+  reconcileInterruptedConnectorActions() {
+    if (!this.db) throw new Error("Database not initialized");
+    const unknown = this.db
+      .prepare(
+        "UPDATE connector_actions SET state = 'unknown', error_code = 'app_quit', updated_at = CURRENT_TIMESTAMP WHERE state = 'committing'"
+      )
+      .run().changes;
+    const cancelled = this.db
+      .prepare(
+        "UPDATE connector_actions SET state = 'cancelled', error_code = 'app_quit', updated_at = CURRENT_TIMESTAMP WHERE state = 'pending'"
+      )
+      .run().changes;
+    const orphaned = this.db
+      .prepare("DELETE FROM connector_actions WHERE account_id IS NULL")
+      .run().changes;
+    return { unknown, cancelled, orphaned };
+  }
+
+  // What find_contact searches. calendar_events only holds a sync window
+  // (about two days back to a month ahead), so the meetings nearest to now go
+  // first, and the contacts table (every synced attendee until its last
+  // source is disconnected) covers older ones, most recently seen first. Only
+  // the user's own meetings count: not cancelled or declined ones, not a
+  // colleague's shared Google calendar (whose people still come through
+  // contacts). Contacts come only from hand-added rows and connected
+  // accounts; rows older builds stored have no source and are left out.
+  // excludedEmails are the user's own addresses and every address a stored
+  // event flags as a room or resource.
+  getContactLookupSources(meetingLimit = 1000) {
+    try {
+      if (!this.db) throw new Error("Database not initialized");
+      const meetings = this.db
+        .prepare(
+          `SELECT start_time, is_all_day, organizer_email, attendees
+             FROM calendar_events
+            WHERE (attendees IS NOT NULL OR organizer_email IS NOT NULL)
+              AND status IN ('confirmed', 'tentative')
+              AND self_response_status != 'declined'
+              AND ${SELECTED_CALENDAR_EVENT_FILTER}
+              AND (provider != 'google' OR EXISTS (
+                SELECT 1 FROM google_calendars
+                 WHERE google_calendars.id = calendar_events.calendar_id
+                   AND (google_calendars.is_primary = 1 OR google_calendars.id = google_calendars.account_email)
+              ))
+            ORDER BY ABS(julianday(start_time) - julianday('now')) IS NULL,
+                     ABS(julianday(start_time) - julianday('now'))
+            LIMIT ?`
+        )
+        .all(meetingLimit);
+      const accounts = this.db
+        .prepare(
+          `SELECT 'google' AS provider, account_email FROM google_calendars
+            WHERE account_email IS NOT NULL
+           UNION
+           SELECT 'microsoft', account_email FROM microsoft_calendars
+            WHERE account_email IS NOT NULL`
+        )
+        .all();
+      const appleConnected = Boolean(this.db.prepare("SELECT 1 FROM apple_calendars").get());
+      const sources = [
+        contactSource("manual"),
+        ...(appleConnected ? [contactSource("apple")] : []),
+        ...accounts.map((row) => contactSource(row.provider, row.account_email)),
+      ];
+      const contacts = this.db
+        .prepare(
+          `SELECT email, display_name FROM contacts
+            WHERE email IN (
+              SELECT email FROM contact_sources
+               WHERE source IN (${sources.map(() => "?").join(", ")})
+            )
+            ORDER BY updated_at DESC`
+        )
+        .all(...sources);
+      const microsoftAliases = this.db
+        .prepare(
+          "SELECT own_addresses FROM microsoft_calendar_tokens WHERE own_addresses IS NOT NULL"
+        )
+        .all()
+        .flatMap((row) => JSON.parse(row.own_addresses));
+      const resources = this.db
+        .prepare(
+          `SELECT DISTINCT attendee.value ->> '$.email' AS email
+             FROM calendar_events, json_each(calendar_events.attendees) AS attendee
+            WHERE json_valid(calendar_events.attendees)
+              AND attendee.value ->> '$.resource' = 1`
+        )
+        .all()
+        .map((row) => row.email);
+      const excludedEmails = [
+        ...accounts.map((row) => row.account_email),
+        ...microsoftAliases,
+        ...resources,
+      ];
+      return { meetings, contacts, excludedEmails };
+    } catch (error) {
+      debugLogger.error("Error reading contact lookup sources", { error: error.message });
+      return { meetings: [], contacts: [], excludedEmails: [] };
+    }
+  }
+
+  // Join & transcribe resumes this note. Google gives every invitee's copy of an
+  // event the same id, so a teammate's synced note for the meeting must never
+  // match, or both apps record into one note. Ownership follows ownsNote() in
+  // spacePermissions.ts, plus Personal rows synced before owners were recorded.
+  getOwnNoteByCalendarEventId(eventId) {
     try {
       if (!this.db) throw new Error("Database not initialized");
       const accountScope = this._accountScopeCondition("notes");
-      const base = `SELECT * FROM notes
-                    WHERE calendar_event_id = ? AND deleted_at IS NULL
-                      AND ${accountScope.sql}`;
-      if (excludeNoteId) {
-        return (
-          this.db
-            .prepare(`${base} AND id != ? LIMIT 1`)
-            .get(eventId, ...accountScope.params, excludeNoteId) || null
-        );
-      }
-      return this.db.prepare(`${base} LIMIT 1`).get(eventId, ...accountScope.params) || null;
+      return (
+        this.db
+          .prepare(
+            `SELECT notes.* FROM notes
+             JOIN spaces ON spaces.id = notes.space_id
+             WHERE notes.calendar_event_id = ? AND notes.deleted_at IS NULL
+               AND ${accountScope.sql}
+               AND (notes.cloud_id IS NULL OR notes.owner_user_id = ?
+                 OR (notes.owner_user_id IS NULL AND spaces.kind = 'private'))
+             ORDER BY datetime(notes.created_at) DESC, notes.id DESC
+             LIMIT 1`
+          )
+          .get(eventId, ...accountScope.params, this.activeAccountId) || null
+      );
     } catch (error) {
       debugLogger.error(
         "Error getting note by calendar event id",
@@ -4345,15 +5192,23 @@ class DatabaseManager {
     }
   }
 
-  upsertContacts(contacts) {
+  // With a source (see contactSource), records that it has seen these
+  // contacts.
+  upsertContacts(contacts, source = null) {
     try {
       if (!this.db) throw new Error("Database not initialized");
       const transaction = this.db.transaction((list) => {
-        const stmt = this.db.prepare(
+        const upsert = this.db.prepare(
           "INSERT INTO contacts (email, display_name, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(email) DO UPDATE SET display_name = COALESCE(excluded.display_name, contacts.display_name), updated_at = CURRENT_TIMESTAMP"
         );
+        const addSource = this.db.prepare(
+          "INSERT OR IGNORE INTO contact_sources (email, source) VALUES (?, ?)"
+        );
         for (const c of list) {
-          if (c.email) stmt.run(c.email.toLowerCase().trim(), c.displayName || null);
+          if (!c.email) continue;
+          const email = c.email.toLowerCase().trim();
+          upsert.run(email, c.displayName || null);
+          if (source) addSource.run(email, source);
         }
       });
       transaction(contacts);
@@ -4364,13 +5219,63 @@ class DatabaseManager {
     }
   }
 
+  // A note participant becomes a hand-added contact only when nothing stored
+  // it before: picking a synced contact from autocomplete leaves it to the
+  // accounts that synced it.
+  addManualContact(contact) {
+    if (!this.db) throw new Error("Database not initialized");
+    const email = contact.email?.toLowerCase().trim();
+    const isNew =
+      Boolean(email) && !this.db.prepare("SELECT 1 FROM contacts WHERE email = ?").get(email);
+    return this.upsertContacts([contact], isNew ? contactSource("manual") : null);
+  }
+
+  // Hand-added contacts stay, whatever a sync says about the address.
+  removeContacts(emails) {
+    try {
+      if (!this.db) throw new Error("Database not initialized");
+      const stmt = this.db.prepare(
+        "DELETE FROM contacts WHERE email = ? AND email NOT IN (SELECT email FROM contact_sources WHERE source = ?)"
+      );
+      const transaction = this.db.transaction((list) => {
+        for (const email of list) stmt.run(email.toLowerCase().trim(), contactSource("manual"));
+      });
+      transaction(emails);
+      return { success: true };
+    } catch (error) {
+      debugLogger.error("Error removing contacts", { error: error.message }, "database");
+      throw error;
+    }
+  }
+
+  // Drops the matching sources and deletes the contacts no other source still
+  // has. Rows older builds stored have no sources and stay.
+  _removeContactSources(match, value) {
+    this.db
+      .prepare(
+        `DELETE FROM contacts
+          WHERE email IN (SELECT email FROM contact_sources WHERE ${match})
+            AND email NOT IN (SELECT email FROM contact_sources WHERE NOT (${match}))`
+      )
+      .run(value, value);
+    this.db.prepare(`DELETE FROM contact_sources WHERE ${match}`).run(value);
+  }
+
+  // A calendar sync's attendees. Rooms and the user's own addresses are
+  // deleted rather than stored: older builds stored them, and nothing else
+  // prunes this table.
+  syncCalendarContacts(provider, accountEmail, contacts, notContacts) {
+    if (contacts.length > 0) this.upsertContacts(contacts, contactSource(provider, accountEmail));
+    if (notContacts.length > 0) this.removeContacts(notContacts);
+  }
+
   searchContacts(query) {
     try {
       if (!this.db) throw new Error("Database not initialized");
       const pattern = `%${query || ""}%`;
       return this.db
         .prepare(
-          "SELECT * FROM contacts WHERE email LIKE ? OR display_name LIKE ? ORDER BY display_name ASC, email ASC LIMIT 20"
+          "SELECT email, display_name, created_at, updated_at FROM contacts WHERE email LIKE ? OR display_name LIKE ? ORDER BY display_name ASC, email ASC LIMIT 20"
         )
         .all(pattern, pattern);
     } catch (error) {
@@ -4386,6 +5291,7 @@ class DatabaseManager {
         this.db.prepare("DELETE FROM calendar_events WHERE provider = 'google'").run();
         this.db.prepare("DELETE FROM google_calendars").run();
         this.db.prepare("DELETE FROM google_calendar_tokens").run();
+        this._removeContactSources("source LIKE ?", contactSource("google", "%"));
       });
       transaction();
       return { success: true };
@@ -4479,13 +5385,14 @@ class DatabaseManager {
     try {
       if (!this.db) throw new Error("Database not initialized");
       const stmt = this.db.prepare(
-        `INSERT INTO microsoft_calendar_tokens (microsoft_email, access_token, refresh_token, expires_at, scope)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO microsoft_calendar_tokens (microsoft_email, access_token, refresh_token, expires_at, scope, tenant_id)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(microsoft_email) DO UPDATE SET
            access_token = excluded.access_token,
            refresh_token = excluded.refresh_token,
            expires_at = excluded.expires_at,
            scope = excluded.scope,
+           tenant_id = COALESCE(excluded.tenant_id, tenant_id),
            updated_at = CURRENT_TIMESTAMP`
       );
       stmt.run(
@@ -4493,7 +5400,8 @@ class DatabaseManager {
         tokens.access_token,
         tokens.refresh_token,
         tokens.expires_at,
-        tokens.scope
+        tokens.scope,
+        tokens.tenant_id ?? null
       );
       return { success: true };
     } catch (error) {
@@ -4525,13 +5433,33 @@ class DatabaseManager {
       if (!this.db) throw new Error("Database not initialized");
       return this.db
         .prepare(
-          "SELECT microsoft_email AS email FROM microsoft_calendar_tokens ORDER BY created_at ASC"
+          "SELECT microsoft_email AS email, tenant_id AS tenantId FROM microsoft_calendar_tokens ORDER BY created_at ASC"
         )
         .all();
     } catch (error) {
       debugLogger.error("Error getting Microsoft accounts", { error: error.message }, "mcal");
       throw error;
     }
+  }
+
+  // The account's other addresses (primary SMTP address, aliases), which
+  // attendee lists use instead of the sign-in name.
+  saveMicrosoftOwnAddresses(email, addresses) {
+    try {
+      if (!this.db) throw new Error("Database not initialized");
+      this.db
+        .prepare("UPDATE microsoft_calendar_tokens SET own_addresses = ? WHERE microsoft_email = ?")
+        .run(JSON.stringify(addresses), email);
+      return { success: true };
+    } catch (error) {
+      debugLogger.error("Error saving Microsoft addresses", { error: error.message }, "mcal");
+      throw error;
+    }
+  }
+
+  getMicrosoftOwnAddresses(email) {
+    const row = this.getMicrosoftTokensByEmail(email);
+    return row?.own_addresses ? JSON.parse(row.own_addresses) : [];
   }
 
   removeMicrosoftAccount(email) {
@@ -4554,6 +5482,7 @@ class DatabaseManager {
         this.db
           .prepare("DELETE FROM microsoft_calendar_tokens WHERE microsoft_email = ?")
           .run(email);
+        this._removeContactSources("source = ?", contactSource("microsoft", email));
       });
       transaction();
       return { success: true };
@@ -4642,6 +5571,7 @@ class DatabaseManager {
         this.db.prepare("DELETE FROM calendar_events WHERE provider = 'microsoft'").run();
         this.db.prepare("DELETE FROM microsoft_calendars").run();
         this.db.prepare("DELETE FROM microsoft_calendar_tokens").run();
+        this._removeContactSources("source LIKE ?", contactSource("microsoft", "%"));
       });
       transaction();
       return { success: true };
@@ -4732,6 +5662,7 @@ class DatabaseManager {
       const transaction = this.db.transaction(() => {
         this.db.prepare("DELETE FROM calendar_events WHERE provider = 'apple'").run();
         this.db.prepare("DELETE FROM apple_calendars").run();
+        this._removeContactSources("source = ?", contactSource("apple"));
       });
       transaction();
       return { success: true };
@@ -5257,16 +6188,25 @@ class DatabaseManager {
       const updaterUpdate = hasExplicitUpdater
         ? "excluded.updated_by_user_id"
         : "updated_by_user_id";
+      // An API that predates template ids omits the key; keep the local one.
+      const templateIdUpdate = Object.prototype.hasOwnProperty.call(
+        cloudNote,
+        "enhancement_template_id"
+      )
+        ? `CASE
+            WHEN COALESCE(excluded.enhanced_content, '') = '' AND COALESCE(enhanced_content, '') <> ''
+            THEN enhancement_template_id ELSE excluded.enhancement_template_id END`
+        : "enhancement_template_id";
       // Sync must never replace non-empty local content/enhanced_content/
       // transcript with an empty cloud value (#1290, the #938 invariant).
-      // The enhancement prompt/hash travel with enhanced_content.
+      // The enhancement prompt/hash/template travel with enhanced_content.
       const stmt = this.db.prepare(`
         INSERT INTO notes (client_note_id, cloud_id, title, content, enhanced_content,
-          enhancement_prompt, enhanced_at_content_hash, note_type, source_file,
+          enhancement_prompt, enhancement_template_id, enhanced_at_content_hash, note_type, source_file,
           audio_duration_seconds, transcript, folder_id, space_id, participants, calendar_event_id,
           diarization_enabled, expected_speaker_count, updated_by_user_id, owner_user_id, created_by_user_id, sync_status, created_at, updated_at,
           cloud_updated_at, account_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'synced', ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'synced', ?, ?, ?, ?)
         ON CONFLICT(client_note_id) DO UPDATE SET
           cloud_id = excluded.cloud_id,
           title = excluded.title,
@@ -5279,6 +6219,7 @@ class DatabaseManager {
           enhancement_prompt = CASE
             WHEN COALESCE(excluded.enhanced_content, '') = '' AND COALESCE(enhanced_content, '') <> ''
             THEN enhancement_prompt ELSE excluded.enhancement_prompt END,
+          enhancement_template_id = ${templateIdUpdate},
           enhanced_at_content_hash = CASE
             WHEN COALESCE(excluded.enhanced_content, '') = '' AND COALESCE(enhanced_content, '') <> ''
             THEN enhanced_at_content_hash ELSE excluded.enhanced_at_content_hash END,
@@ -5307,6 +6248,7 @@ class DatabaseManager {
         cloudNote.content,
         cloudNote.enhanced_content || null,
         cloudNote.enhancement_prompt || null,
+        cloudNote.enhancement_template_id || null,
         cloudNote.enhanced_at_content_hash || null,
         cloudNote.note_type || "personal",
         cloudNote.source_file || null,
@@ -6589,9 +7531,24 @@ class DatabaseManager {
   upsertTranscriptionFromCloud(cloudTranscription) {
     try {
       if (!this.db) throw new Error("Database not initialized");
+      const text = cloudTranscription.text ?? "";
+      const rawText = cloudTranscription.raw_text || null;
+      const status = cloudTranscription.status || "completed";
+      // timestamp is what the history list sorts and groups on, so it takes the
+      // cloud row's own instant rather than defaulting to the moment of the
+      // pull -- which would land a whole archive at "now", above everything
+      // spoken since. Deliberately not in the conflict update: a row this
+      // device recorded already carries the recording's start time, which is
+      // more precise than the cloud's creation time for the same dictation.
+      //
+      // The separator is normalized because that sort is a TEXT comparison and
+      // the API sends ISO 8601: "T" (0x54) outranks the space (0x20) every
+      // locally written row uses, so a raw cloud value would sort above every
+      // local dictation from the same UTC day whatever the hour.
+      const cloudOccurredAt = toDbTimestamp(cloudTranscription.created_at);
       const stmt = this.db.prepare(`
-        INSERT INTO transcriptions (client_transcription_id, cloud_id, text, raw_text, status, sync_status, created_at)
-        VALUES (?, ?, ?, ?, ?, 'synced', ?)
+        INSERT INTO transcriptions (client_transcription_id, cloud_id, text, raw_text, status, sync_status, created_at, timestamp)
+        VALUES (?, ?, ?, ?, ?, 'synced', ?, COALESCE(?, CURRENT_TIMESTAMP))
         ON CONFLICT(client_transcription_id) DO UPDATE SET
           cloud_id = excluded.cloud_id,
           text = excluded.text,
@@ -6599,17 +7556,32 @@ class DatabaseManager {
           status = excluded.status,
           sync_status = 'synced'
       `);
-      stmt.run(
-        cloudTranscription.client_transcription_id,
-        cloudTranscription.id,
-        cloudTranscription.text ?? "",
-        cloudTranscription.raw_text || null,
-        cloudTranscription.status || "completed",
-        cloudTranscription.created_at
-      );
-      return this.db
-        .prepare("SELECT * FROM transcriptions WHERE client_transcription_id = ?")
-        .get(cloudTranscription.client_transcription_id);
+      return this.db.transaction(() => {
+        const existing = this.db
+          .prepare(
+            `SELECT id, text, raw_text, status FROM transcriptions
+             WHERE client_transcription_id = ?`
+          )
+          .get(cloudTranscription.client_transcription_id);
+        if (
+          existing &&
+          (existing.text !== text || existing.raw_text !== rawText || existing.status !== status)
+        ) {
+          this._invalidateAnalyticsHistoryFromTranscription(existing.id);
+        }
+        stmt.run(
+          cloudTranscription.client_transcription_id,
+          cloudTranscription.id,
+          text,
+          rawText,
+          status,
+          cloudTranscription.created_at,
+          cloudOccurredAt
+        );
+        return this.db
+          .prepare("SELECT * FROM transcriptions WHERE client_transcription_id = ?")
+          .get(cloudTranscription.client_transcription_id);
+      })();
     } catch (error) {
       debugLogger.error(
         "Error upserting transcription from cloud",

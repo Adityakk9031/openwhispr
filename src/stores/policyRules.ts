@@ -19,6 +19,39 @@ function managedPolicy(state: PolicyDecisionSnapshot): OrgPolicy | null {
   return state.status === "managed" && state.policy ? state.policy : null;
 }
 
+const KNOWN_BYOK_PROVIDER_IDS: Record<PolicyScope, ReadonlySet<string>> = {
+  transcription: new Set([
+    ...modelRegistryData.transcriptionProviders.map((provider) => provider.id),
+    "custom",
+  ]),
+  llm: new Set([
+    ...modelRegistryData.cloudProviders.map((provider) => provider.id),
+    "custom",
+    "openrouter",
+  ]),
+};
+
+const warnedUnknownByokProviderIds = new Set<string>();
+
+/**
+ * The scope's BYOK allowlist, filtered to provider ids this build knows. The
+ * field is validated shape-only, so an id from a newer server reaches here and
+ * is dropped with a warning instead of invalidating the whole policy — it can
+ * grant nothing an older app could act on. Mirrors requiredLocalModelIds.
+ */
+function allowedByokProviderIds(policy: OrgPolicy, scope: PolicyScope): string[] {
+  const known = KNOWN_BYOK_PROVIDER_IDS[scope];
+  return policy[scope].allowedByokProviders.filter((id) => {
+    if (known.has(id)) return true;
+    const key = `${scope}:${id}`;
+    if (!warnedUnknownByokProviderIds.has(key)) {
+      warnedUnknownByokProviderIds.add(key);
+      console.warn(`[policy] Ignoring unknown ${scope} BYOK provider id: ${id}`);
+    }
+    return false;
+  });
+}
+
 export function isPolicyActionAllowed(state: PolicyDecisionSnapshot): boolean {
   if (state.status === "idle" || state.status === "unmanaged") return true;
   if (state.status !== "managed" || !state.policy) return false;
@@ -49,6 +82,36 @@ export function effectiveLocalHistoryEnabled(
   personalPreference: boolean
 ): boolean {
   return lockedLocalHistoryValue(state) ?? personalPreference;
+}
+
+/**
+ * Whether the managed policy that can force local history off has settled.
+ *
+ * `effectiveLocalHistoryEnabled` resolves an unsettled policy to the user's own
+ * preference, which is the right value to show and to sweep retention with --
+ * but it is a default, not an answer, and one consumer reads that switch as
+ * consent: the main process reconstructs Insights history from stored
+ * transcripts the first time the renderer reports it. A scan finishes in
+ * milliseconds while the policy is a network round trip, so a workspace with
+ * `localHistoryMode: "always_off"` would have its members' existing transcripts
+ * mined before the policy forbidding it ever arrived.
+ *
+ * `idle` is unsettled here even though `isPolicyActionAllowed` treats it as
+ * permissive, because it covers both "no account" and "signed in, fetch not
+ * started". Only the main process can tell those apart, from the account scope
+ * it persists, so it makes that call.
+ */
+export function isLocalHistoryPolicyResolved(state: PolicyDecisionSnapshot): boolean {
+  return state.status === "managed" || state.status === "unmanaged";
+}
+
+/**
+ * Whether this window has applied whatever policy it will get. `idle` and
+ * `loading` may still be a signed-in window before its fetch lands, while
+ * `error` applies no policy and is as final as `managed` or `unmanaged`.
+ */
+export function isPolicySettled(state: PolicyDecisionSnapshot): boolean {
+  return state.status !== "idle" && state.status !== "loading";
 }
 
 /** The org-forced local history value, or null when the user may choose. */
@@ -89,7 +152,7 @@ export function isProviderAllowedByPolicy(
   providerId: string
 ): boolean {
   return managedPolicyDecision(state, (policy) =>
-    policy[scope].allowedByokProviders.includes(providerId)
+    allowedByokProviderIds(policy, scope).includes(providerId)
   );
 }
 
@@ -140,12 +203,39 @@ export function isWebSearchAllowed(state: PolicyDecisionSnapshot): boolean {
   return managedPolicyDecision(state, (policy) => policy.features.webSearchEnabled);
 }
 
+/** Whether a resolved org policy turned web search off (not one still loading). */
+export function isWebSearchBlockedByOrg(state: PolicyDecisionSnapshot): boolean {
+  return state.status === "managed" && isPolicyActionAllowed(state) && !isWebSearchAllowed(state);
+}
+
 /**
  * Whether the voice agent may attach screen context. Servers that predate the
  * field send none; absent means allowed.
  */
 export function isScreenContextAllowed(state: PolicyDecisionSnapshot): boolean {
   return managedPolicyDecision(state, (policy) => policy.features.screenContextEnabled !== false);
+}
+
+/**
+ * Whether agent connectors may run. They are agent tools, so turning the
+ * agent off turns them off too. Servers that predate the field send none;
+ * absent means allowed.
+ */
+export function isConnectorsAllowed(state: PolicyDecisionSnapshot): boolean {
+  return managedPolicyDecision(
+    state,
+    (policy) => policy.features.agentEnabled && policy.features.connectorsEnabled !== false
+  );
+}
+
+/**
+ * Whether a resolved org policy turned connectors off. Unlike
+ * isConnectorsAllowed, a policy that is still loading or failed to load is not
+ * reported as an org decision, and neither is one that only requires a newer
+ * app version (the update banner says that).
+ */
+export function isConnectorsBlockedByOrg(state: PolicyDecisionSnapshot): boolean {
+  return state.status === "managed" && isPolicyActionAllowed(state) && !isConnectorsAllowed(state);
 }
 
 const warnedUnknownRequiredModelIds = new Set<string>();
@@ -228,8 +318,9 @@ export function resolveEffectivePolicySelection(
   const policy = managedPolicy(state);
   if (!policy) return null;
 
+  const policyByokProviders = allowedByokProviderIds(policy, scope);
   const allowedByokProviders = catalog.byokProviders.filter((provider) =>
-    policy[scope].allowedByokProviders.includes(provider)
+    policyByokProviders.includes(provider)
   );
   const allowedEnterpriseProviders = (catalog.enterpriseProviders ?? []).filter((provider) =>
     (policy[scope].allowedEnterpriseProviders ?? []).includes(provider)
@@ -392,6 +483,8 @@ export function isShareActionAllowed(
   }
   if (action === "create-link") return isShareVisibilityAllowed(state, "link");
   if (action === "set-domain") return isShareVisibilityAllowed(state, "domain");
+  // A private note suspends its invitations and has no link for the email to carry.
+  if (action === "resend-invitation" && currentVisibility === "private") return false;
   return isShareVisibilityAllowed(state, "invited");
 }
 
@@ -419,11 +512,10 @@ function policyModeHasAvailableProvider(
   providerCatalog?: Pick<PolicySelectionCatalog, "byokProviders" | "enterpriseProviders">
 ): boolean {
   if (mode === "providers") {
+    const allowed = allowedByokProviderIds(policy, scope);
     return providerCatalog
-      ? providerCatalog.byokProviders.some((provider) =>
-          policy[scope].allowedByokProviders.includes(provider)
-        )
-      : policy[scope].allowedByokProviders.length > 0;
+      ? providerCatalog.byokProviders.some((provider) => allowed.includes(provider))
+      : allowed.length > 0;
   }
   if (mode === "enterprise") {
     const allowed = policy[scope].allowedEnterpriseProviders ?? [];

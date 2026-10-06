@@ -1,23 +1,39 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { BarChart3, Cloud, Flame, Gauge, Loader2, Mic2 } from "lucide-react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { BarChart3, Cloud, CloudUpload, Flame, Gauge, Mic2, Trophy } from "./icons";
 import { useTranslation } from "react-i18next";
 import { useAuth } from "../hooks/useAuth";
+import { useHotkey } from "../hooks/useHotkey";
 import { useInsightsSyncOptIn } from "../hooks/useInsightsSyncOptIn";
 import { useSettings } from "../hooks/useSettings";
+import { hasValidatedAuthContext } from "../lib/authRequestContext";
 import {
   getAccountAnalyticsSummary,
   subscribeToAnalyticsRefresh,
-  syncPendingAnalytics,
 } from "../services/AnalyticsService";
+import { syncService } from "../services/SyncService";
 import { buildAnalyticsActivityDays } from "../helpers/analytics";
 import { canOfferAnalyticsClaim } from "../services/syncPassPolicy";
 import { effectiveLocalHistoryEnabled } from "../stores/policyRules";
+import { useLeaderboardParticipationStore } from "../stores/leaderboardParticipationStore";
 import { usePolicyStore } from "../stores/policyStore";
 import type { AnalyticsDailyBucket, AnalyticsSummary } from "../types/electron";
 import { cn } from "./lib/utils";
+import LeaderboardSkeleton from "./LeaderboardSkeleton";
+import { Button } from "./ui/button";
+import DictationHotkeyHint from "./ui/DictationHotkeyHint";
+import EmptyStateCard from "./ui/EmptyStateCard";
+import { PAGE_CONTENT_WIDTH_CLASS } from "./ui/pageWidth";
+import { Skeleton } from "./ui/skeleton";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
 import { Tooltip } from "./ui/tooltip";
 
 type ActivityDay = { date: string; words: number };
+
+interface InsightsViewProps {
+  onSignIn: () => void;
+}
+
+const LeaderboardView = lazy(() => import("./LeaderboardView"));
 
 const ACTIVITY_INTENSITY_CLASSES = [
   "bg-foreground/6 dark:bg-white/6",
@@ -32,10 +48,10 @@ function dateFromLocalKey(value: string) {
   return new Date(year, month - 1, day, 12);
 }
 
-function Heatmap({ daily }: { daily: AnalyticsDailyBucket[] }) {
+function Heatmap({ daily }: { daily: AnalyticsDailyBucket[] | null }) {
   const { t, i18n } = useTranslation();
   const calendar = useMemo(() => {
-    const days: ActivityDay[] = buildAnalyticsActivityDays(daily);
+    const days: ActivityDay[] = buildAnalyticsActivityDays(daily ?? []);
     const cells: Array<ActivityDay | null> = [
       ...Array(dateFromLocalKey(days[0].date).getDay()).fill(null),
       ...days,
@@ -116,7 +132,13 @@ function Heatmap({ daily }: { daily: AnalyticsDailyBucket[] }) {
             ))}
           </div>
 
-          <div className="grid gap-2" style={columnStyle}>
+          {/* Until the summary arrives every day reads as empty, so the cells pulse and
+              stay inert: no "0 words" tooltip or label for a day that isn't counted yet. */}
+          <div
+            className={cn("grid gap-2", !daily && "animate-pulse")}
+            style={columnStyle}
+            inert={!daily}
+          >
             {calendar.weeks.map((week, weekIndex) => (
               <div key={weekIndex} className="grid grid-rows-7 gap-0.5">
                 {week.map((day, dayIndex) => {
@@ -184,12 +206,13 @@ function MetricCard({
 }: {
   icon: typeof BarChart3;
   label: string;
-  value: string;
-  detail: string;
+  // Null until the summary loads; the line holds a skeleton meanwhile.
+  value: string | null;
+  detail: string | null;
   largeValue?: boolean;
 }) {
   return (
-    <div className="rounded-xl border border-border/40 dark:border-white/8 bg-card/70 p-4">
+    <div className="rounded-xl border border-border/70 dark:border-white/10 bg-card/70 p-4">
       <div className="flex items-center gap-2 text-muted-foreground">
         <Icon size={14} />
         <span className="text-xs">{label}</span>
@@ -200,26 +223,154 @@ function MetricCard({
           largeValue ? "text-3xl" : "text-2xl"
         )}
       >
-        {value}
+        {value ?? (
+          <Skeleton className={cn("inline-block w-20 align-middle", largeValue ? "h-7" : "h-6")} />
+        )}
       </p>
-      <p className="mt-1 text-[11px] text-muted-foreground/70">{detail}</p>
+      <p className="mt-1 text-[11px] text-muted-foreground/70">
+        {detail ?? <Skeleton className="inline-block h-2.5 w-24 align-middle" />}
+      </p>
     </div>
   );
 }
 
-export default function InsightsView() {
+// The dashboard a user gets once they've dictated: the metric cards over the activity
+// heatmap. Null while the summary loads; every value holds a skeleton meanwhile.
+function UsageDashboard({ summary }: { summary: AnalyticsSummary | null }) {
   const { t, i18n } = useTranslation();
-  const { isSignedIn, isLoaded } = useAuth();
-  const { dataRetentionEnabled: personalDataRetentionEnabled, insightsSyncEnabled } = useSettings();
-  const dataRetentionEnabled = usePolicyStore((policyState) =>
-    effectiveLocalHistoryEnabled(policyState, personalDataRetentionEnabled)
+  // i18n.language, not the runtime default: the OS locale is not the language
+  // the app is being read in, so a Japanese UI rendered 12.3K where 1.2万
+  // belongs, next to correctly localized month labels in the same card.
+  const number = useMemo(
+    () => new Intl.NumberFormat(i18n.language, { notation: "compact", maximumFractionDigits: 1 }),
+    [i18n.language]
   );
-  const { enableInsightsSync, optInDialog, syncAllowedByPolicy, unclaimedCount } =
-    useInsightsSyncOptIn();
-  // A managed workspace that forbids cloud backup forbids these counters with
-  // it, so the view stays device-scoped even with the preference left on.
-  const syncActive =
-    isSignedIn && insightsSyncEnabled && syncAllowedByPolicy && dataRetentionEnabled;
+
+  return (
+    <>
+      {!summary && (
+        <p role="status" className="sr-only">
+          {t("controlPanel.loading")}
+        </p>
+      )}
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <MetricCard
+          icon={Mic2}
+          label={t("insights.wordsSpoken")}
+          value={summary && number.format(summary.totalWords)}
+          detail={t("insights.allTime")}
+          largeValue
+        />
+        <MetricCard
+          icon={Gauge}
+          label={t("insights.wordsPerMinute")}
+          value={summary && (summary.averageWpm == null ? "—" : number.format(summary.averageWpm))}
+          detail={summary && t("insights.wpmCoverage", { count: summary.wpmCoveragePercent })}
+          largeValue
+        />
+        <MetricCard
+          icon={BarChart3}
+          label={t("insights.dictations")}
+          value={summary && number.format(summary.totalDictations)}
+          detail={t("insights.allTime")}
+          largeValue
+        />
+        <MetricCard
+          icon={Flame}
+          label={t("insights.currentStreak")}
+          value={summary && t("insights.days", { count: summary.currentStreakDays })}
+          detail={summary && t("insights.longestStreak", { count: summary.longestStreakDays })}
+        />
+      </div>
+
+      <div className="mt-5 rounded-2xl border border-border/70 bg-card/70 px-5 py-2.5 dark:border-white/10">
+        <h2 className="text-base font-medium text-foreground">{t("insights.activity")}</h2>
+        <div className="mt-2">
+          <Heatmap daily={summary?.daily ?? null} />
+        </div>
+      </div>
+    </>
+  );
+}
+
+// 0 ≤ n < 1, stable per index, so the preview's heatmap is the same on every visit.
+function unitHash(index: number) {
+  let x = Math.imul(index ^ (index >>> 16), 0x45d9f3b);
+  x = Math.imul(x ^ (x >>> 16), 0x45d9f3b);
+  return ((x ^ (x >>> 16)) >>> 0) / 2 ** 32;
+}
+
+// Sample usage for the locked preview: a few months of dictation that is busier on
+// weekdays and picks up over time, so the heatmap reads like a real one.
+function buildPreviewSummary(): AnalyticsSummary {
+  const days = buildAnalyticsActivityDays([]);
+  const daily = days.map(({ date }, index) => {
+    const progress = index / (days.length - 1);
+    const weekday = dateFromLocalKey(date).getDay();
+    const chance = weekday === 0 || weekday === 6 ? 0.15 : 0.3 + progress * 0.55;
+    const words =
+      unitHash(index) < chance
+        ? Math.round((0.3 + unitHash(index + days.length) * 0.7) * (400 + progress * 1600))
+        : 0;
+    return { date, words, dictations: 0, spokenDurationMs: 0 };
+  });
+  return {
+    totalWords: daily.reduce((sum, day) => sum + day.words, 0),
+    totalDictations: 1260,
+    totalSpokenDurationMs: 0,
+    averageWpm: 142,
+    currentStreakDays: 12,
+    longestStreakDays: 21,
+    wpmCoveragePercent: 96,
+    daily,
+  };
+}
+
+// Before the first dictation: the dashboard as it will look, filled with sample
+// usage and locked behind a card that says how to start.
+function UsagePreview() {
+  const { t } = useTranslation();
+  const { hotkey } = useHotkey();
+  const summary = useMemo(buildPreviewSummary, []);
+
+  return (
+    <div className="relative">
+      <div
+        aria-hidden="true"
+        inert
+        className="pointer-events-none select-none opacity-50 blur-[1px] [mask-image:linear-gradient(to_bottom,#000_45%,transparent)]"
+      >
+        <UsageDashboard summary={summary} />
+      </div>
+      <div className="absolute inset-0 flex items-center justify-center p-6">
+        <EmptyStateCard
+          icon={BarChart3}
+          title={t("insights.emptyTitle")}
+          description={t("insights.emptyBody")}
+          headingLevel={2}
+          className="w-full max-w-sm bg-background/95 shadow-xl dark:bg-surface-1/95"
+        >
+          <DictationHotkeyHint hotkey={hotkey} className="text-[13px]" />
+        </EmptyStateCard>
+      </div>
+    </div>
+  );
+}
+
+function YourUsage({
+  accountId,
+  dataRetentionEnabled,
+  isLoaded,
+  onSyncErrorChange,
+  syncActive,
+}: {
+  accountId: string | null;
+  dataRetentionEnabled: boolean;
+  isLoaded: boolean;
+  onSyncErrorChange: (error: boolean) => void;
+  syncActive: boolean;
+}) {
+  const { t } = useTranslation();
   const [summary, setSummary] = useState<AnalyticsSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [syncError, setSyncError] = useState(false);
@@ -254,9 +405,10 @@ export default function InsightsView() {
 
     try {
       if (isLoaded && syncActive) {
-        await syncPendingAnalytics();
-        const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-        const account = await getAccountAnalyticsSummary(timeZone);
+        if (!(await syncService.syncAnalyticsNow())) {
+          throw new Error("Insights uploads are not enabled for this account");
+        }
+        const account = await getAccountAnalyticsSummary(accountId);
         if (requestId !== requestIdRef.current) return;
         setSummary(account);
       } else {
@@ -270,68 +422,33 @@ export default function InsightsView() {
     } finally {
       if (requestId === requestIdRef.current) setLoading(false);
     }
-  }, [isLoaded, syncActive]);
+  }, [accountId, isLoaded, syncActive]);
 
   useEffect(() => subscribeToAnalyticsRefresh(load, syncActive), [load, syncActive]);
 
-  // i18n.language, not the runtime default: the OS locale is not the language
-  // the app is being read in, so a Japanese UI rendered 12.3K where 1.2万
-  // belongs, next to correctly localized month labels in the same card.
-  const number = useMemo(
-    () => new Intl.NumberFormat(i18n.language, { notation: "compact", maximumFractionDigits: 1 }),
-    [i18n.language]
-  );
+  useEffect(() => {
+    onSyncErrorChange(syncError);
+  }, [onSyncErrorChange, syncError]);
 
   if (loadFailed) {
     return (
-      <div className="mx-auto w-full max-w-5xl px-6 py-8">
-        <div className="rounded-lg border border-border bg-card/50 backdrop-blur-sm dark:bg-card/60">
-          <div className="flex flex-col items-center justify-center gap-3 px-4 py-16 text-center">
-            <p className="max-w-sm text-sm text-muted-foreground">{t("insights.loadError")}</p>
-            <button
-              type="button"
-              onClick={() => void load()}
-              className="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-foreground hover:bg-accent"
-            >
-              {t("common.retry")}
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  if (!summary) {
-    return (
-      <div className="mx-auto w-full max-w-5xl px-6 py-8">
-        <div className="rounded-lg border border-border bg-card/50 backdrop-blur-sm dark:bg-card/60">
-          <div className="flex items-center justify-center gap-2 py-8">
-            <Loader2 size={14} className="animate-spin text-primary" />
-            <span className="text-sm text-muted-foreground">{t("controlPanel.loading")}</span>
-          </div>
+      <div className="rounded-lg border border-border bg-card/50 backdrop-blur-sm dark:bg-card/60">
+        <div className="flex flex-col items-center justify-center gap-3 px-4 py-16 text-center">
+          <p className="max-w-sm text-sm text-muted-foreground">{t("insights.loadError")}</p>
+          <button
+            type="button"
+            onClick={() => void load()}
+            className="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-foreground hover:bg-accent"
+          >
+            {t("common.retry")}
+          </button>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="mx-auto w-full max-w-5xl px-6 py-8">
-      <div className="mb-6 flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-base! font-semibold! leading-none! tracking-normal! text-foreground">
-            {t("insights.title")}
-          </h1>
-        </div>
-        <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
-          <Cloud size={13} />
-          {syncActive
-            ? syncError
-              ? t("insights.syncFallback")
-              : t("insights.synced")
-            : t("insights.onDevice")}
-        </div>
-      </div>
-
+    <>
       {!dataRetentionEnabled && (
         <div className="mb-5 rounded-lg border border-amber-500/30 bg-amber-500/5 dark:bg-amber-500/10 px-3.5 py-2.5 flex items-center gap-2.5">
           <span className="text-amber-600 dark:text-amber-400 shrink-0 text-sm">⊘</span>
@@ -341,78 +458,126 @@ export default function InsightsView() {
         </div>
       )}
 
-      {canOfferAnalyticsClaim({
-        signedIn: isSignedIn,
-        syncAllowedByPolicy,
-        dataRetentionEnabled,
-        insightsSyncEnabled,
-        unclaimedCount,
-      }) && (
-        <div className="mb-5 flex items-center justify-between gap-4 rounded-xl border border-primary/15 bg-primary/5 px-4 py-3">
-          <p className="text-xs text-muted-foreground">
-            {t(insightsSyncEnabled ? "insights.claimTitle" : "insights.syncPrompt")}
-          </p>
-          <button
-            type="button"
-            onClick={enableInsightsSync}
-            className="shrink-0 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
-          >
-            {t(insightsSyncEnabled ? "insights.claimInclude" : "insights.enableSync")}
-          </button>
-        </div>
-      )}
+      {summary?.totalDictations === 0 ? <UsagePreview /> : <UsageDashboard summary={summary} />}
+    </>
+  );
+}
 
-      {summary.totalDictations === 0 ? (
-        <div className="rounded-lg border border-border bg-card/50 backdrop-blur-sm dark:bg-card/60">
-          <div className="flex flex-col items-center justify-center px-4 py-16 text-center">
-            <BarChart3 size={40} className="mb-4 text-foreground/15" aria-hidden="true" />
-            <h2 className="text-sm font-medium text-foreground">{t("insights.emptyTitle")}</h2>
-            <p className="mt-1.5 max-w-sm text-xs text-muted-foreground">
-              {t("insights.emptyBody")}
-            </p>
-          </div>
-        </div>
-      ) : (
-        <>
-          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-            <MetricCard
-              icon={Mic2}
-              label={t("insights.wordsSpoken")}
-              value={number.format(summary.totalWords)}
-              detail={t("insights.allTime")}
-              largeValue
-            />
-            <MetricCard
-              icon={Gauge}
-              label={t("insights.wordsPerMinute")}
-              value={summary.averageWpm == null ? "—" : number.format(summary.averageWpm)}
-              detail={t("insights.wpmCoverage", { count: summary.wpmCoveragePercent })}
-              largeValue
-            />
-            <MetricCard
-              icon={BarChart3}
-              label={t("insights.dictations")}
-              value={number.format(summary.totalDictations)}
-              detail={t("insights.allTime")}
-              largeValue
-            />
-            <MetricCard
-              icon={Flame}
-              label={t("insights.currentStreak")}
-              value={t("insights.days", { count: summary.currentStreakDays })}
-              detail={t("insights.longestStreak", { count: summary.longestStreakDays })}
-            />
-          </div>
+export default function InsightsView({ onSignIn }: InsightsViewProps) {
+  const { t } = useTranslation();
+  const { isLoaded, isSignedIn, user } = useAuth();
+  const authValidated = hasValidatedAuthContext();
+  const { dataRetentionEnabled: personalDataRetentionEnabled, insightsSyncEnabled } = useSettings();
+  const dataRetentionEnabled = usePolicyStore((policyState) =>
+    effectiveLocalHistoryEnabled(policyState, personalDataRetentionEnabled)
+  );
+  const { canToggleSync, enableInsightsSync, optInDialog, syncAllowedByPolicy, unclaimedCount } =
+    useInsightsSyncOptIn();
+  const participationEnabled = useLeaderboardParticipationStore((state) => state.enabled);
+  const participationError = useLeaderboardParticipationStore((state) => state.error);
+  const participationReady = useLeaderboardParticipationStore((state) => state.ready);
+  const participationLeavePending = useLeaderboardParticipationStore((state) => state.leavePending);
+  const [activeTab, setActiveTab] = useState("usage");
+  const [syncError, setSyncError] = useState(false);
+  // A managed workspace that forbids cloud backup forbids these counters with
+  // it, so the page stays device-scoped even with the preference left on.
+  const syncActive =
+    isSignedIn &&
+    authValidated &&
+    insightsSyncEnabled &&
+    syncAllowedByPolicy &&
+    dataRetentionEnabled;
+  const claimAvailable = canOfferAnalyticsClaim({
+    signedIn: isSignedIn,
+    syncAllowedByPolicy,
+    dataRetentionEnabled,
+    insightsSyncEnabled,
+    unclaimedCount,
+  });
+  const showSyncAction =
+    activeTab === "usage" && isSignedIn && authValidated && (!syncActive || claimAvailable);
+  const syncActionDisabled = !canToggleSync || !dataRetentionEnabled || !syncAllowedByPolicy;
+  const syncStatusLabel = syncActive
+    ? syncError
+      ? t("insights.syncFallback")
+      : t("insights.synced")
+    : t("insights.onDevice");
 
-          <div className="mt-5 rounded-2xl border border-border/50 bg-card/70 px-5 py-2.5 dark:border-white/8">
-            <h2 className="text-base font-medium text-foreground">{t("insights.activity")}</h2>
-            <div className="mt-2">
-              <Heatmap daily={summary.daily} />
+  return (
+    <div className={cn(PAGE_CONTENT_WIDTH_CLASS, "flex min-h-full flex-col px-6 py-6")}>
+      <Tabs value={activeTab} onValueChange={setActiveTab} className="flex flex-1 flex-col">
+        <div className="flex min-h-8 items-center justify-between gap-4">
+          <TabsList className="h-7 p-0.5 rounded-[7px]">
+            <TabsTrigger value="usage" className="h-6 px-2.5 text-xs rounded-[5px]">
+              {t("insights.yourUsage")}
+            </TabsTrigger>
+            <TabsTrigger value="leaderboard" className="h-6 px-2.5 text-xs rounded-[5px]">
+              {t("insights.leaderboard.title")}
+            </TabsTrigger>
+          </TabsList>
+
+          {activeTab === "usage" ? (
+            <div className="flex shrink-0 items-center gap-3">
+              <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                <Cloud size={13} />
+                {syncStatusLabel}
+              </div>
+              {showSyncAction && (
+                <Button
+                  type="button"
+                  variant="default"
+                  size="sm"
+                  className="h-7 rounded-[7px] px-2.5 text-[11px]"
+                  disabled={syncActionDisabled}
+                  onClick={() => void enableInsightsSync()}
+                >
+                  <CloudUpload size={13} />
+                  {t(syncActive ? "insights.claimInclude" : "insights.enableSync")}
+                </Button>
+              )}
             </div>
-          </div>
-        </>
-      )}
+          ) : (
+            isSignedIn &&
+            participationReady &&
+            participationError === null &&
+            !participationEnabled && (
+              <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                <Trophy size={13} />
+                {t(
+                  participationLeavePending
+                    ? "insights.leaderboard.leavePending"
+                    : "insights.leaderboard.disabled"
+                )}
+              </div>
+            )
+          )}
+        </div>
 
+        <TabsContent value="usage" className="mt-6 flex flex-1 flex-col">
+          <YourUsage
+            accountId={user?.id ?? null}
+            dataRetentionEnabled={dataRetentionEnabled}
+            isLoaded={isLoaded}
+            onSyncErrorChange={setSyncError}
+            syncActive={syncActive}
+          />
+          {isLoaded && !syncActive && (
+            <p className="mt-auto pt-8 text-center text-[11px] text-muted-foreground/70">
+              {t("insights.onDevicePrivacy")}
+            </p>
+          )}
+        </TabsContent>
+        <TabsContent value="leaderboard" className="mt-0">
+          <Suspense fallback={isSignedIn ? <LeaderboardSkeleton /> : null}>
+            <LeaderboardView
+              enableInsightsSync={enableInsightsSync}
+              insightsSyncEnabled={insightsSyncEnabled}
+              onSignIn={onSignIn}
+              syncAllowedByPolicy={syncAllowedByPolicy}
+            />
+          </Suspense>
+        </TabsContent>
+      </Tabs>
       {optInDialog}
     </div>
   );
