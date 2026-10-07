@@ -4773,7 +4773,42 @@
       "underway": "Es klingt, als wäre dein Meeting schon im Gange. Notizen aufnehmen?"
     },
     "start": "Notizen aufnehmen",
-    "join": "Beitreten & transkribieren"
+    "join": "Beitreten & transkribieren",
+    "folders": {
+      "choose": "Besprechungsordner auswählen",
+      "search": "Ordner suchen",
+      "clear": "Suche löschen",
+      "private": "Privat",
+      "shared": "Geteilt",
+      "current": "Aktueller Speicherort",
+      "recent": "Zuletzt verwendet",
+      "folders": "Ordner",
+      "new": "Neuer Ordner",
+      "name": "Name",
+      "location": "Speicherort",
+      "cancel": "Abbrechen",
+      "create": "Erstellen und auswählen",
+      "empty": "Keine Ordner gefunden. Suche einen anderen Namen oder erstelle einen Ordner.",
+      "loading": "Ordner werden geladen…",
+      "unavailable": "Ordner konnten nicht geladen werden.",
+      "retry": "Erneut versuchen",
+      "dismiss": "Besprechungsbenachrichtigung schließen",
+      "selected": "{{destination}} ausgewählt",
+      "linked": "Für diese Besprechung gibt es bereits eine Notiz. Beim Beitreten bleibt sie in {{destination}}.",
+      "errors": {
+        "STALE_NOTIFICATION": "Diese Benachrichtigung ist nicht mehr aktuell.",
+        "INVALID_REQUEST": "Vorgang fehlgeschlagen. Bitte erneut versuchen.",
+        "FOLDERS_UNAVAILABLE": "Ordner konnten nicht geladen werden.",
+        "FOLDER_UNAVAILABLE": "Dieser Speicherort ist nicht verfügbar. Wähle einen anderen Ordner.",
+        "SPACE_UNAVAILABLE": "Dieser Speicherort ist nicht verfügbar. Wähle einen anderen Ordner.",
+        "FOLDER_NAME_REQUIRED": "Gib einen Ordnernamen ein.",
+        "FOLDER_NAME_TAKEN": "An diesem Speicherort existiert bereits ein Ordner mit diesem Namen.",
+        "CREATE_FAILED": "Vorgang fehlgeschlagen. Bitte erneut versuchen.",
+        "LINKED_NOTE_CHANGED": "Prüfe den Speicherort und tritt erneut bei.",
+        "NOTE_UNAVAILABLE": "Diese Notiz ist nicht verfügbar. Versuche es erneut, ohne eine neue zu erstellen.",
+        "START_FAILED": "Vorgang fehlgeschlagen. Bitte erneut versuchen."
+      }
+    }
   },
   "providerErrors": {
     "authFailed": "{{provider}} hat Ihren API-Schlüssel abgelehnt.",

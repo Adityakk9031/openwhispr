@@ -4773,7 +4773,42 @@
       "underway": "On dirait que votre réunion est déjà en cours. Vous voulez prendre des notes ?"
     },
     "start": "Prendre des notes",
-    "join": "Rejoindre et transcrire"
+    "join": "Rejoindre et transcrire",
+    "folders": {
+      "choose": "Choisir le dossier de réunion",
+      "search": "Rechercher des dossiers",
+      "clear": "Effacer la recherche",
+      "private": "Privé",
+      "shared": "Partagé",
+      "current": "Destination actuelle",
+      "recent": "Récemment utilisés",
+      "folders": "Dossiers",
+      "new": "Nouveau dossier",
+      "name": "Nom",
+      "location": "Emplacement",
+      "cancel": "Annuler",
+      "create": "Créer et sélectionner",
+      "empty": "Aucun dossier trouvé. Essayez un autre nom ou créez un dossier.",
+      "loading": "Chargement des dossiers…",
+      "unavailable": "Impossible de charger les dossiers.",
+      "retry": "Réessayer",
+      "dismiss": "Fermer la notification de réunion",
+      "selected": "{{destination}} sélectionné",
+      "linked": "Cette réunion a déjà une note. Elle restera dans {{destination}} lorsque vous rejoindrez la réunion.",
+      "errors": {
+        "STALE_NOTIFICATION": "Cette notification n’est plus à jour.",
+        "INVALID_REQUEST": "Impossible de terminer. Réessayez.",
+        "FOLDERS_UNAVAILABLE": "Impossible de charger les dossiers.",
+        "FOLDER_UNAVAILABLE": "Cette destination est indisponible. Choisissez un autre dossier.",
+        "SPACE_UNAVAILABLE": "Cette destination est indisponible. Choisissez un autre dossier.",
+        "FOLDER_NAME_REQUIRED": "Saisissez un nom de dossier.",
+        "FOLDER_NAME_TAKEN": "Un dossier porte déjà ce nom à cet emplacement.",
+        "CREATE_FAILED": "Impossible de terminer. Réessayez.",
+        "LINKED_NOTE_CHANGED": "Vérifiez la destination, puis rejoignez à nouveau.",
+        "NOTE_UNAVAILABLE": "Cette note est indisponible. Réessayez sans en créer une autre.",
+        "START_FAILED": "Impossible de terminer. Réessayez."
+      }
+    }
   },
   "providerErrors": {
     "authFailed": "{{provider}} a rejeté votre clé API.",
