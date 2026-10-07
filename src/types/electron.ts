@@ -1099,6 +1099,7 @@ export interface PasteToolsResult {
   hasUinput?: boolean;
   hasWtype?: boolean;
   isWlroots?: boolean;
+  isCosmic?: boolean;
   tools?: string[];
   recommendedInstall?: string;
 }
@@ -2213,6 +2214,7 @@ declare global {
         isNixOS: boolean;
         isKde: boolean;
         isWlroots: boolean;
+        isCosmic: boolean;
         hasXclip: boolean;
         hasXsel: boolean;
       }>;

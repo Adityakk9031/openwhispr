@@ -1510,6 +1510,7 @@
     "waylandClipboardTitle": "Clipboard Mode on Wayland",
     "windowsReady": "Windows supports automatic pasting out of the box. No setup required!",
     "withoutToolPrefix": "Without this tool, OpenWhispr will copy text to your clipboard. You can then paste manually with Ctrl+V.",
+    "wtypeCosmicTerminalsDescription": "On COSMIC, terminals such as Warp only receive pasted text through wtype. Other apps already paste without it.",
     "wtypeFallbackDescription": "wtype is the preferred auto-paste method for this wlroots compositor. A fallback is available, but may be less reliable.",
     "xwaylandAppsOnly": "automatic pasting works for XWayland apps only"
   },
@@ -2296,7 +2297,7 @@
         "recheck": "Re-check",
         "copy": "Copy",
         "ydotoolDesc": "Input automation tool for Wayland",
-        "wtypeDesc": "Preferred input automation tool on wlroots compositors",
+        "wtypeDesc": "Preferred input automation tool on wlroots compositors; on COSMIC, used to paste into terminals",
         "ydotooldDesc": "Daemon for ydotool (separate package on Ubuntu/Pop!_OS)",
         "uinputDesc": "Kernel input device access",
         "uinputRuleFound": "Rule present but not active. A reboot should fix it.",
