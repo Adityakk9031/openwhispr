@@ -180,7 +180,11 @@ const {
   getMeetingStreamingClient,
   getMeetingConnectionKey,
 } = require("./meetingStreamingProviders");
-const { fetchRealtimeTokenForProvider } = require("./realtimeTokenProviders");
+const {
+  createServerTokenPoster,
+  fetchRealtimeTokenForProvider,
+  isSignInRefusal,
+} = require("./realtimeTokenProviders");
 const { getCalendarAvailability } = require("./calendarAvailabilityService");
 
 // Meeting capture runs at 24 kHz (see meetingRecordingStore AudioContext); cloud
@@ -7600,7 +7604,12 @@ class IPCHandlers {
           }
           resetMeetingReconnectAudio();
           if (!win.isDestroyed()) {
-            win.webContents.send("meeting-transcription-error", error.message);
+            // A renewal refused for the session gets a sentinel the renderer explains,
+            // instead of the API's bare "Invalid session" (#2427).
+            win.webContents.send(
+              "meeting-transcription-error",
+              isSignInRefusal(error) ? "signInExpired" : error.message
+            );
           }
           return canRestoreOld;
         }
@@ -7613,39 +7622,13 @@ class IPCHandlers {
     };
 
     const fetchRealtimeToken = async (event, options, { streams } = {}) => {
-      const postServerToken = async (path, body = {}) => {
-        const apiUrl = getApiUrl();
-        if (!apiUrl) {
-          const err = new Error("OpenWhispr API URL not configured");
-          err.code = "NO_API";
-          throw err;
-        }
-        const authHeader = await getAuthHeader(event);
-        if (!Object.keys(authHeader).length) throw new Error("Not authenticated");
-        const url = `${apiUrl}${path}`;
-        let response;
-        try {
-          response = await proxyFetch(url, {
-            method: "POST",
-            headers: withPolicyHeaders({ "Content-Type": "application/json", ...authHeader }),
-            body: JSON.stringify(body),
-          });
-        } catch (err) {
-          const classified = classifyAndLog(err, url);
-          if (classified.isNetworkError) {
-            throw Object.assign(new Error(err.message || "Network request failed"), {
-              code: "NETWORK_ERROR",
-              networkCode: classified.code,
-              messageKey: classified.messageKey,
-            });
-          }
-          throw err;
-        }
-        if (!response.ok) {
-          throw await readPolicyResponseError(response, `Token request failed: ${response.status}`);
-        }
-        return response.json();
-      };
+      const postServerToken = createServerTokenPoster({
+        getApiUrl,
+        getAuthHeader: () => getAuthHeader(event),
+        proxyFetch,
+        withPolicyHeaders,
+        classifyAndLog,
+      });
 
       return fetchRealtimeTokenForProvider(
         options.provider,
