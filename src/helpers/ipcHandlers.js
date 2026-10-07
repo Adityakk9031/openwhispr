@@ -1739,9 +1739,28 @@ class IPCHandlers {
       return this.windowManager.resizeDictationErrorWindowToContent(surfaceHeight);
     });
 
+    // Counts changes to any key in Settings. A streaming socket keeps the count it
+    // was opened under, so a start never reuses one authenticated before a change.
+    let credentialGeneration = 0;
+    const saveSecretKey = (getter, saver, storeKey) => (event, key) => {
+      if (typeof key !== "string") throw new TypeError("API key must be a string");
+      // Committing an unedited key field saves the same value again.
+      const changed = this.environmentManager[getter]() !== key;
+      const result = this.environmentManager[saver](key);
+      if (!changed) return result;
+      credentialGeneration += 1;
+      // Notify peers by setting name only; leave the editor's pending input alone.
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed() && win.webContents.id !== event.sender.id) {
+          win.webContents.send("api-key-updated", storeKey);
+        }
+      }
+      return result;
+    };
+
     for (const k of BYOK_API_KEYS) {
       ipcMain.handle(`get-${k.base}-key`, () => this.environmentManager[k.get]());
-      ipcMain.handle(`save-${k.base}-key`, (event, key) => this.environmentManager[k.save](key));
+      ipcMain.handle(`save-${k.base}-key`, saveSecretKey(k.get, k.save, k.storeKey));
     }
 
     ipcMain.handle("db-save-transcription", async (event, text, rawText, options) => {
@@ -4864,17 +4883,19 @@ class IPCHandlers {
       return this.environmentManager.getCortiClientId();
     });
 
-    ipcMain.handle("save-corti-client-id", async (event, key) => {
-      return this.environmentManager.saveCortiClientId(key);
-    });
+    ipcMain.handle(
+      "save-corti-client-id",
+      saveSecretKey("getCortiClientId", "saveCortiClientId", "cortiClientId")
+    );
 
     ipcMain.handle("get-corti-client-secret", async () => {
       return this.environmentManager.getCortiClientSecret();
     });
 
-    ipcMain.handle("save-corti-client-secret", async (event, key) => {
-      return this.environmentManager.saveCortiClientSecret(key);
-    });
+    ipcMain.handle(
+      "save-corti-client-secret",
+      saveSecretKey("getCortiClientSecret", "saveCortiClientSecret", "cortiClientSecret")
+    );
 
     ipcMain.handle(
       "proxy-corti-transcription",
@@ -4939,17 +4960,23 @@ class IPCHandlers {
       return this.environmentManager.getCustomTranscriptionKey();
     });
 
-    ipcMain.handle("save-custom-transcription-key", async (event, key) => {
-      return this.environmentManager.saveCustomTranscriptionKey(key);
-    });
+    ipcMain.handle(
+      "save-custom-transcription-key",
+      saveSecretKey(
+        "getCustomTranscriptionKey",
+        "saveCustomTranscriptionKey",
+        "customTranscriptionApiKey"
+      )
+    );
 
     ipcMain.handle("get-cleanup-custom-key", async () => {
       return this.environmentManager.getCleanupCustomKey();
     });
 
-    ipcMain.handle("save-cleanup-custom-key", async (event, key) => {
-      return this.environmentManager.saveCleanupCustomKey(key);
-    });
+    ipcMain.handle(
+      "save-cleanup-custom-key",
+      saveSecretKey("getCleanupCustomKey", "saveCleanupCustomKey", "cleanupCustomApiKey")
+    );
 
     // Enterprise provider key handlers
     ipcMain.handle("get-bedrock-region", async () => {
@@ -4967,21 +4994,28 @@ class IPCHandlers {
     ipcMain.handle("get-bedrock-access-key-id", async () => {
       return this.environmentManager.getBedrockAccessKeyId();
     });
-    ipcMain.handle("save-bedrock-access-key-id", async (event, key) => {
-      return this.environmentManager.saveBedrockAccessKeyId(key);
-    });
+    ipcMain.handle(
+      "save-bedrock-access-key-id",
+      saveSecretKey("getBedrockAccessKeyId", "saveBedrockAccessKeyId", "bedrockAccessKeyId")
+    );
     ipcMain.handle("get-bedrock-secret-access-key", async () => {
       return this.environmentManager.getBedrockSecretAccessKey();
     });
-    ipcMain.handle("save-bedrock-secret-access-key", async (event, key) => {
-      return this.environmentManager.saveBedrockSecretAccessKey(key);
-    });
+    ipcMain.handle(
+      "save-bedrock-secret-access-key",
+      saveSecretKey(
+        "getBedrockSecretAccessKey",
+        "saveBedrockSecretAccessKey",
+        "bedrockSecretAccessKey"
+      )
+    );
     ipcMain.handle("get-bedrock-session-token", async () => {
       return this.environmentManager.getBedrockSessionToken();
     });
-    ipcMain.handle("save-bedrock-session-token", async (event, key) => {
-      return this.environmentManager.saveBedrockSessionToken(key);
-    });
+    ipcMain.handle(
+      "save-bedrock-session-token",
+      saveSecretKey("getBedrockSessionToken", "saveBedrockSessionToken", "bedrockSessionToken")
+    );
     ipcMain.handle("get-azure-endpoint", async () => {
       return this.environmentManager.getAzureEndpoint();
     });
@@ -4991,9 +5025,10 @@ class IPCHandlers {
     ipcMain.handle("get-azure-api-key", async () => {
       return this.environmentManager.getAzureApiKey();
     });
-    ipcMain.handle("save-azure-api-key", async (event, key) => {
-      return this.environmentManager.saveAzureApiKey(key);
-    });
+    ipcMain.handle(
+      "save-azure-api-key",
+      saveSecretKey("getAzureApiKey", "saveAzureApiKey", "azureApiKey")
+    );
     ipcMain.handle("get-azure-deployment", async () => {
       return this.environmentManager.getAzureDeployment();
     });
@@ -5021,9 +5056,10 @@ class IPCHandlers {
     ipcMain.handle("get-vertex-api-key", async () => {
       return this.environmentManager.getVertexApiKey();
     });
-    ipcMain.handle("save-vertex-api-key", async (event, key) => {
-      return this.environmentManager.saveVertexApiKey(key);
-    });
+    ipcMain.handle(
+      "save-vertex-api-key",
+      saveSecretKey("getVertexApiKey", "saveVertexApiKey", "vertexApiKey")
+    );
 
     // Enterprise provider test connection
     ipcMain.handle("test-enterprise-connection", async (event, provider, config) => {
@@ -8742,14 +8778,19 @@ class IPCHandlers {
     };
 
     // What a dictation connection was opened for; a start or warmup reuses one
-    // only when nothing about the route changed.
-    const dictationConnectionKey = (options) =>
-      JSON.stringify([
-        options.provider || "openai-realtime",
+    // only when nothing about the route changed and, for a connection that reads
+    // a saved key, no key was saved since.
+    const dictationConnectionKey = (options) => {
+      const provider = options.provider || "openai-realtime";
+      const readsSavedKey = options.mode === "byok" || provider === "tinfoil-realtime";
+      return JSON.stringify([
+        provider,
         options.mode,
         options.model,
         options.baseUrl,
+        readsSavedKey ? credentialGeneration : null,
       ]);
+    };
 
     const connectDictationStreaming = async (event, options) => {
       // Older renderers did not label the OpenAI dictation adapter. Dictation
@@ -10954,6 +10995,23 @@ class IPCHandlers {
         ? fetchRealtimeToken(event, { mode: "byok", provider: "assemblyai-realtime" })
         : fetchStreamingToken(event);
 
+    // A warm socket opened before the latest key save still carries the old key;
+    // dropping it sends the start out on a fresh connect with the new one. Starts
+    // check right before connecting, because a warmup that was still minting can
+    // open its socket during the start's own token fetch.
+    const dropStaleWarmConnection = (streaming) => {
+      if (streaming.warmConnectionOptions?.credentialGeneration !== credentialGeneration) {
+        streaming.cleanupWarmConnection();
+      }
+    };
+
+    // A warmup replaces a stale ready socket instead of reporting it warm, so the
+    // next start finds one with the new key. A socket still opening is left to the
+    // start: closing it mid-handshake would fail the warmup that opened it.
+    const dropStaleReadyWarmConnection = (streaming) => {
+      if (streaming.hasWarmConnection()) dropStaleWarmConnection(streaming);
+    };
+
     ipcMain.handle("assemblyai-streaming-warmup", async (event, options = {}) => {
       try {
         const byok = options.mode === "byok";
@@ -10965,19 +11023,26 @@ class IPCHandlers {
           this.assemblyAiStreaming = new AssemblyAiStreaming();
         }
         this.assemblyAiStreaming.adoptMode(options);
+        if (byok) dropStaleReadyWarmConnection(this.assemblyAiStreaming);
 
         if (this.assemblyAiStreaming.hasWarmConnection()) {
           debugLogger.debug("AssemblyAI connection already warm", {}, "streaming");
           return { success: true, alreadyWarm: true };
         }
 
+        // Read before the key is, so a save during the mint marks this socket stale.
+        const generation = credentialGeneration;
         let token = byok ? null : this.assemblyAiStreaming.getCachedToken();
         if (!token) {
           debugLogger.debug("Fetching new streaming token for warmup", { byok }, "streaming");
           token = await fetchAssemblyAiToken(event, byok);
         }
 
-        await this.assemblyAiStreaming.warmup({ ...options, token });
+        await this.assemblyAiStreaming.warmup({
+          ...options,
+          token,
+          credentialGeneration: generation,
+        });
         debugLogger.debug("AssemblyAI connection warmed up", {}, "streaming");
 
         return { success: true };
@@ -11060,6 +11125,7 @@ class IPCHandlers {
           }
         };
 
+        if (byok) dropStaleWarmConnection(this.assemblyAiStreaming);
         await this.assemblyAiStreaming.connect({ ...options, token });
         debugLogger.debug("AssemblyAI streaming started", {}, "streaming");
 
@@ -11221,12 +11287,14 @@ class IPCHandlers {
         this.deepgramStreaming.adoptMode(options);
 
         setDeepgramTokenRefreshFn(event, byok);
+        if (byok) dropStaleReadyWarmConnection(this.deepgramStreaming);
 
         if (this.deepgramStreaming.hasWarmConnection()) {
           debugLogger.debug("Deepgram connection already warm", {}, "streaming");
           return { success: true, alreadyWarm: true };
         }
 
+        const generation = credentialGeneration;
         let token = byok ? null : this.deepgramStreaming.getCachedToken();
         if (!token) {
           debugLogger.debug(
@@ -11237,7 +11305,11 @@ class IPCHandlers {
           token = await fetchDeepgramToken(event, byok);
         }
 
-        await this.deepgramStreaming.warmup({ ...options, token });
+        await this.deepgramStreaming.warmup({
+          ...options,
+          token,
+          credentialGeneration: generation,
+        });
         debugLogger.debug("Deepgram connection warmed up", {}, "streaming");
 
         return { success: true };
@@ -11276,6 +11348,7 @@ class IPCHandlers {
           this.deepgramStreaming = new DeepgramStreaming();
         }
         this.deepgramStreaming.adoptMode(options);
+        if (byok) dropStaleWarmConnection(this.deepgramStreaming);
 
         setDeepgramTokenRefreshFn(event, byok);
 
@@ -11437,6 +11510,11 @@ class IPCHandlers {
       return streaming;
     };
 
+    // What a Gemini connection authenticated with: a managed one never serves a
+    // BYOK start or the reverse, and a BYOK one is not reused after a key save.
+    const geminiConnectionKey = (options) =>
+      options.mode === "byok" ? `byok:${credentialGeneration}` : "managed";
+
     const connectGeminiStreaming = (event, options) => {
       if (geminiConnectInFlight) return geminiConnectInFlight;
       geminiConnectInFlight = (async () => {
@@ -11447,6 +11525,7 @@ class IPCHandlers {
         // Buffer before the token fetch (a real network round trip) so
         // gemini-streaming-send has somewhere to put the first frames.
         streaming.beginConnecting();
+        streaming.connectionKey = geminiConnectionKey(options);
         const token = await fetchRealtimeToken(event, tokenOptions);
         await streaming.connect({
           ...options,
@@ -11484,7 +11563,10 @@ class IPCHandlers {
       try {
         const streaming = ensureGeminiStreaming(event);
         if (geminiConnectInFlight) await geminiConnectInFlight;
-        const usedWarmConnection = streaming.isConnected && !options.forceNew;
+        const usedWarmConnection =
+          streaming.isConnected &&
+          !options.forceNew &&
+          streaming.connectionKey === geminiConnectionKey(options);
         if (!usedWarmConnection) {
           if (streaming.isConnected) await streaming.disconnect(false);
           await connectGeminiStreaming(event, options);
@@ -11565,9 +11647,11 @@ class IPCHandlers {
         if (!this.cortiStreaming) {
           this.cortiStreaming = new CortiStreaming();
         }
+        dropStaleReadyWarmConnection(this.cortiStreaming);
         if (this.cortiStreaming.hasWarmConnection() || this.cortiStreaming.isConnected) {
           return { success: true, alreadyWarm: true };
         }
+        const generation = credentialGeneration;
         const { token, environment, tenant } = await this._mintStoredCortiToken(options);
         await this.cortiStreaming.warmup({
           token,
@@ -11575,6 +11659,7 @@ class IPCHandlers {
           tenant,
           language: options.language,
           keyterms: options.keyterms,
+          credentialGeneration: generation,
         });
         return { success: true };
       } catch (error) {
@@ -11607,6 +11692,7 @@ class IPCHandlers {
           if (win && !win.isDestroyed()) win.webContents.send("corti-session-end", data);
         };
 
+        dropStaleWarmConnection(this.cortiStreaming);
         await this.cortiStreaming.connect({
           token,
           environment,

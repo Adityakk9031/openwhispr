@@ -35,6 +35,7 @@ class CortiStreaming {
     this.sampleRate = SAMPLE_RATE;
     this.warmConnection = null;
     this.warmConnectionReady = false;
+    this.warmConnectionOptions = null;
     this.warmSessionId = null;
     this.warmSessionStartedAt = null;
     this.keepAliveInterval = null;
@@ -80,6 +81,19 @@ class CortiStreaming {
     this.preConfigBufferSize = 0;
     this.audioBytesSent = 0;
     this.sampleRate = options.sampleRate || SAMPLE_RATE;
+
+    // A warm socket is bound to the region and tenant it opened against.
+    if (
+      this.hasWarmConnection() &&
+      (this.warmConnectionOptions.environment !== environment ||
+        this.warmConnectionOptions.tenant !== tenant)
+    ) {
+      debugLogger.debug("Corti warm connection differs, cold-starting", {
+        warm: [this.warmConnectionOptions.environment, this.warmConnectionOptions.tenant],
+        requested: [environment, tenant],
+      });
+      this.cleanupWarmConnection();
+    }
 
     // Reuse the pre-warmed socket for an instant start; cold-connect otherwise.
     if (this.useWarmConnection()) {
@@ -178,6 +192,7 @@ class CortiStreaming {
     }
 
     this.warmConnectionReady = false;
+    this.warmConnectionOptions = options;
     this.warmSessionId = null;
     this.sampleRate = options.sampleRate || SAMPLE_RATE;
 
@@ -187,21 +202,22 @@ class CortiStreaming {
 
     return new Promise((resolve, reject) => {
       let settled = false;
+      const socket = new WebSocket(url);
+      this.warmConnection = socket;
+
       const warmupTimeout = setTimeout(() => {
         if (settled) return;
         settled = true;
-        this.cleanupWarmConnection();
+        if (this.warmConnection === socket) this.cleanupWarmConnection();
         reject(new Error("Corti warmup connection timeout"));
       }, WEBSOCKET_TIMEOUT_MS);
 
-      this.warmConnection = new WebSocket(url);
-
-      this.warmConnection.on("open", () => {
+      socket.on("open", () => {
         debugLogger.debug("Corti warm connection opened, sending config");
-        this.warmConnection.send(JSON.stringify({ type: "config", configuration }));
+        socket.send(JSON.stringify({ type: "config", configuration }));
       });
 
-      this.warmConnection.on("message", (data) => {
+      socket.on("message", (data) => {
         let message;
         try {
           message = JSON.parse(data.toString());
@@ -220,9 +236,9 @@ class CortiStreaming {
         }
       });
 
-      this.warmConnection.on("error", (error) => {
+      socket.on("error", (error) => {
         debugLogger.error("Corti warmup connection error", { error: error.message });
-        this.cleanupWarmConnection();
+        if (this.warmConnection === socket) this.cleanupWarmConnection();
         if (!settled) {
           settled = true;
           clearTimeout(warmupTimeout);
@@ -230,8 +246,16 @@ class CortiStreaming {
         }
       });
 
-      this.warmConnection.on("close", (code, reason) => {
+      socket.on("close", (code, reason) => {
         clearTimeout(warmupTimeout);
+        // A dropped socket closes after its replacement may have opened; leave that one be.
+        if (this.warmConnection !== socket) {
+          if (!settled) {
+            settled = true;
+            reject(new Error(`Corti warmup connection closed (code: ${code})`));
+          }
+          return;
+        }
         const wasReady = this.warmConnectionReady;
         debugLogger.debug("Corti warm connection closed", {
           code,
@@ -316,6 +340,7 @@ class CortiStreaming {
       this.warmConnection = null;
     }
     this.warmConnectionReady = false;
+    this.warmConnectionOptions = null;
     this.warmSessionId = null;
     this.warmSessionStartedAt = null;
   }
