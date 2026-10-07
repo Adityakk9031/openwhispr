@@ -315,7 +315,7 @@ Offline semantic search that finds notes by meaning, not just keywords. Used by 
 - **build-globe-listener.js**: Compiles macOS Globe key listener from Swift source
 - **build-macos-mic-listener.js**: Compiles macOS mic listener from Swift source
 - **build-macos-window-bounds.js**: Compiles the System Settings window reporter from Swift source
-- **build-windows-key-listener.js**: Compiles Windows key listener (for local development)
+- **build-windows-key-listener.js**: Compiles the Windows key listener (MSVC, MinGW or clang) whenever `compile:native` runs on a Windows host, downloading the prebuilt binary when no compiler works; skips a binary newer than its source
 - **run-electron.js**: Development script to launch Electron with proper environment
 - **lib/download-utils.js**: Shared utilities for downloading and extracting files
   - `fetchLatestRelease(repo, options)`: Fetches latest release from GitHub API
@@ -561,10 +561,11 @@ Native Windows support for true push-to-talk functionality using low-level keybo
 
 **Binary Distribution**:
 
-- Prebuilt binary downloaded from GitHub releases (`windows-key-listener-v*` tags)
-- Download script: `scripts/download-windows-key-listener.js`
-- CI workflow: `.github/workflows/build-windows-key-listener.yml`
-- Fallback to tap mode if binary unavailable
+- Compiled from source by `scripts/build-windows-key-listener.js`, part of `compile:native`, so every `prebuild*`, `predev:main` and `prestart` chain on a Windows host builds it; neither script runs on other hosts
+- Fallback: prebuilt binary from GitHub releases (`windows-key-listener-v*` tags) via `scripts/download-windows-key-listener.js`
+- Release CI (`release.yml`, `build-and-notarize.yml`) compiles it with MSVC during `build:win`
+- CI workflow: `.github/workflows/build-windows-key-listener.yml` rebuilds the prebuilt binary when `resources/windows-key-listener.c` changes on main
+- `afterPack.js` fails a Windows package without the binary. A dev run without it starts with Hold unavailable (a saved Hold is reset to Tap at startup), modifier-only hotkeys refused, and `F8` as the default hotkey (`hotkeyManager.js`)
 
 **IPC Events**:
 
@@ -890,10 +891,10 @@ UI icons come from `src/components/icons/` (vendored Nucleo core outline compone
    - **Lockfile**: Always use Node 24 when running `npm install` (matches CI). If your local Node version differs, use `nvm exec 24 npm install`. Running `npm install` with a different major version will produce an incompatible `package-lock.json` that breaks `npm ci` in CI.
 
 5. **Windows Push-to-Talk Binary**:
-   - Prebuilt binary downloaded automatically on Windows during build
-   - If neither compiling nor the download produces it, `afterPack.js` fails the Windows build
+   - Compiled from `resources/windows-key-listener.c` whenever `compile:native` runs on a Windows host (`prebuild:win`, `predev:main`, …); the prebuilt binary download from GitHub releases is the fallback
+   - If neither compiling nor the download produces it, `afterPack.js` fails the Windows build; an unpackaged dev run starts without it, with Hold and modifier-only hotkeys unavailable and `F8` as the default hotkey
    - To compile locally: install Visual Studio Build Tools or MinGW-w64
-   - CI workflow (`.github/workflows/build-windows-key-listener.yml`) auto-builds on push to main
+   - CI workflow (`.github/workflows/build-windows-key-listener.yml`) rebuilds the prebuilt binary when `resources/windows-key-listener.c` changes on main
 
 6. **Meeting Detection Not Working**:
    - Check debug logs for "event-driven" vs "polling" mode; macOS also logs `macOS microphone detection capability` as `PID` or `AGGREGATE`
@@ -939,8 +940,8 @@ UI icons come from `src/components/icons/` (vendored Nucleo core outline compone
 - **Push-to-Talk**: Native key listener binary (`windows-key-listener.exe`) enables true push-to-talk
   - Uses Windows Low-Level Keyboard Hook (`WH_KEYBOARD_LL`)
   - Supports compound hotkeys (e.g., `Ctrl+Shift+F11`)
-  - Prebuilt binary auto-downloaded from GitHub releases
-  - Falls back to tap mode if unavailable
+  - Compiled from source during the build, with the prebuilt GitHub release binary as fallback (see section 12, Binary Distribution)
+  - `afterPack.js` fails a Windows package without it
 
 **Linux**:
 
