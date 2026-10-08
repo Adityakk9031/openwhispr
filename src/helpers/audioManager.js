@@ -1,4 +1,8 @@
 import ReasoningService from "../services/ReasoningService";
+import {
+  EMPTY_OUTPUT_MESSAGE_KEY,
+  TRUNCATED_OUTPUT_MESSAGE_KEY,
+} from "../services/ai/chatRequestBody";
 import logger from "../utils/logger";
 import { assertValidCleanupOutput } from "../utils/cleanupOutput";
 import { isAzureOpenAIEndpoint } from "../utils/urlUtils";
@@ -97,7 +101,11 @@ import {
   resolveTranslatedText,
   shouldRunTranslateStep,
 } from "./translationChain";
-import { detectAgentName, stripAgentAddress } from "../config/agentDetection";
+import {
+  detectAgentName,
+  stripAgentAddress,
+  stripAgentAddressPreservingFormatting,
+} from "../config/agentDetection";
 import {
   resolveDictationRouteKind,
   resolveAgentImageTarget,
@@ -132,6 +140,10 @@ import { shouldDisplayDictationPreview } from "../utils/transcriptionPreview";
 import {
   buildSelectionEditSystemPrompt,
   buildSelectionEditUserPrompt,
+  buildLocalSelectionEditSystemPrompt,
+  buildLocalSelectionEditUserPrompt,
+  extractLocalSelectionEditReplacement,
+  SELECTION_EDIT_RESPONSE_FORMAT,
   extractSelectionEditReplacement,
   getSelectionCaptureDisposition,
 } from "./selectionEditing";
@@ -544,6 +556,16 @@ const PROXY_TRANSCRIPTION_PROVIDERS = {
   },
 };
 
+// Selection-edit copy for a failed reply, looked up by the cause's messageKey,
+// then by its code.
+const SELECTION_EDIT_FAILURE_COPY = {
+  SELECTION_EDIT_INVALID_RESPONSE: "invalidResponse",
+  OUTPUT_COMPLETION_UNVERIFIED: "invalidResponse",
+  SELECTION_EDIT_EMPTY_RESPONSE: "emptyResponse",
+  [EMPTY_OUTPUT_MESSAGE_KEY]: "emptyResponse",
+  [TRUNCATED_OUTPUT_MESSAGE_KEY]: "truncatedResponse",
+};
+
 class AudioManager {
   constructor() {
     this.mediaRecorder = null;
@@ -788,6 +810,9 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
   }
 
   finalizeChineseScript(text, settings = getSettings()) {
+    // A selection edit has already applied its explicit language instruction.
+    // A dictation-wide script preference must not rewrite that document again.
+    if (this.pendingSelectionEdit) return text;
     return applyChineseScript(
       text,
       resolveChineseScriptTarget(
@@ -2849,20 +2874,45 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       temperature: config?.temperature ?? 0.2,
       requireCompleteOutput: true,
     };
-    const completionMarker = `__OPENWHISPR_SELECTION_COMPLETE_${crypto.randomUUID()}__`;
-    selectionConfig.systemPrompt = buildSelectionEditSystemPrompt(
-      config?.systemPrompt,
-      completionMarker
-    );
-    if (selectionConfig.textOnlySystemPrompt) {
-      // The text-only retry prompt must carry the same selection-edit
-      // instructions and marker, or a rejected screenshot loses the command.
-      selectionConfig.textOnlySystemPrompt = buildSelectionEditSystemPrompt(
-        selectionConfig.textOnlySystemPrompt,
+    const isLocalSelection = config?.provider === "local";
+    let userPrompt;
+    let completionMarker;
+    if (isLocalSelection) {
+      const settings = getSettings();
+      selectionConfig.systemPrompt = buildLocalSelectionEditSystemPrompt({
+        customPrompt: (settings.customPrompts.dictationAgent || "").replace(
+          /\{\{agentName\}\}/g,
+          agentName?.trim() || "Assistant"
+        ),
+        dictionary: getDictionaryHintWords(settings),
+      });
+      selectionConfig.responseFormat = SELECTION_EDIT_RESPONSE_FORMAT;
+      selectionConfig.disableThinking = true;
+      const instruction = this.voiceAgentRequested
+        ? text
+        : stripAgentAddressPreservingFormatting(
+            text,
+            agentName,
+            wakeWordLanguage ?? resolveWakeWordLanguage(settings),
+            config?.snippets ?? settings.snippets
+          );
+      userPrompt = buildLocalSelectionEditUserPrompt(instruction, capture.text);
+    } else {
+      completionMarker = `__OPENWHISPR_SELECTION_COMPLETE_${crypto.randomUUID()}__`;
+      selectionConfig.systemPrompt = buildSelectionEditSystemPrompt(
+        config?.systemPrompt,
         completionMarker
       );
+      if (selectionConfig.textOnlySystemPrompt) {
+        // The text-only retry prompt must carry the same selection-edit
+        // instructions and marker, or a rejected screenshot loses the command.
+        selectionConfig.textOnlySystemPrompt = buildSelectionEditSystemPrompt(
+          selectionConfig.textOnlySystemPrompt,
+          completionMarker
+        );
+      }
+      userPrompt = buildSelectionEditUserPrompt(text, capture.text);
     }
-    const userPrompt = buildSelectionEditUserPrompt(text, capture.text);
 
     try {
       const result = await this.processWithReasoningModel(
@@ -2872,13 +2922,19 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         selectionConfig
       );
       if (wasCancelled()) return text;
-      const replacement = extractSelectionEditReplacement(result, completionMarker);
+      const replacement = isLocalSelection
+        ? extractLocalSelectionEditReplacement(result)
+        : extractSelectionEditReplacement(result, completionMarker);
       this.pendingSelectionEdit = { sessionId: capture.sessionId };
       return replacement;
     } catch (cause) {
-      const error = new Error(`Selection edit failed: ${cause.message}`);
-      error.code = "SELECTION_EDIT_REASONING_FAILED";
-      error.messageKey = "hooks.audioRecording.selectionEditing.reasoningFailed";
+      const error = Object.assign(new Error(`Selection edit failed: ${cause.message}`), cause);
+      const failure =
+        SELECTION_EDIT_FAILURE_COPY[cause.messageKey] || SELECTION_EDIT_FAILURE_COPY[cause.code];
+      error.code = cause.code || "SELECTION_EDIT_REASONING_FAILED";
+      error.messageKey = failure
+        ? `hooks.audioRecording.selectionEditing.${failure}`
+        : cause.messageKey || "hooks.audioRecording.selectionEditing.reasoningFailed";
       error.selectionEditFatal = true;
       error.cause = cause;
       throw error;
@@ -5552,12 +5608,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         if (wasCancelled()) return true;
         if (reasonError.selectionEditFatal) {
           this.pendingSelectionEdit = null;
-          this.onError?.({
-            title: "Selection Edit Failed",
-            description: reasonError.message,
-            code: reasonError.code,
-            messageKey: reasonError.messageKey,
-          });
+          this.onError?.(transcriptionFailureOutcome(reasonError).report);
           this.isProcessing = false;
           this.onStateChange?.({ isRecording: false, isProcessing: false, isStreaming: false });
           return false;
