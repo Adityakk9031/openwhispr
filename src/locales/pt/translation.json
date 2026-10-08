@@ -967,7 +967,8 @@
       },
       "pasteFailed": {
         "title": "Não foi possível colar automaticamente"
-      }
+      },
+      "interruptedRecordingRecovered": "Recuperado após o OpenWhispr fechar antes de terminar este ditado."
     },
     "clipboard": {
       "pasteFailed": {

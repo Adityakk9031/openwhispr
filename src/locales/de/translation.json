@@ -988,7 +988,8 @@
       },
       "pasteFailed": {
         "title": "Automatisches Einfügen fehlgeschlagen"
-      }
+      },
+      "interruptedRecordingRecovered": "Wiederhergestellt, nachdem OpenWhispr vor dem Ende dieses Diktats beendet wurde."
     },
     "clipboard": {
       "pasteFailed": {

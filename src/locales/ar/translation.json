@@ -92,7 +92,8 @@
       },
       "pasteFailed": {
         "title": "تعذّر اللصق تلقائيًا"
-      }
+      },
+      "interruptedRecordingRecovered": "تمت استعادته بعد إغلاق OpenWhispr قبل انتهاء هذا الإملاء."
     },
     "clipboard": {
       "pasteFailed": {

@@ -988,7 +988,8 @@
       },
       "pasteFailed": {
         "title": "Impossibile incollare automaticamente"
-      }
+      },
+      "interruptedRecordingRecovered": "Recuperata dopo la chiusura di OpenWhispr prima della fine di questa dettatura."
     },
     "clipboard": {
       "pasteFailed": {
