@@ -8863,8 +8863,9 @@ class IPCHandlers {
 
       // The renderer is already streaming frames when a start redials (it wires
       // the worklet before calling start), so the old session is retired without
-      // a commit or a wait: a commit would only surface its head as a final from
-      // the wrong session, and every frame sent meanwhile belongs to the new one.
+      // a wait, and without a commit where the client supports skipping it: a
+      // commit would only surface its head as a final from the wrong session.
+      // Frames that reached the old session before the start are dropped with it.
       if (this._dictationStreaming) {
         retireDictationStreaming(this._dictationStreaming);
         this._dictationStreaming = null;

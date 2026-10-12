@@ -162,7 +162,7 @@ test("a cloud start sends the language with the token request and leaves the mod
   assert.equal(calls.connects[0].options.preconfigured, true);
 });
 
-test("the cloud token request carries the base language code and omits it for auto", async (t) => {
+test("the cloud token request carries the base language code and leaves it unset for auto", async (t) => {
   const s = scenario(t);
   await s.invoke("dictation-realtime-start", byok({ mode: "openwhispr", language: "zh-TW" }));
   await s.invoke("dictation-realtime-stop");
@@ -198,10 +198,10 @@ test("a start redials when the warm connection was minted for another language",
 });
 
 // The renderer streams worklet frames before dictation-realtime-start arrives,
-// so a redial happens with audio already in flight: those frames belong to the
-// new session, and the retiring one must not be committed (its head would come
-// back as a wrong-language final) or waited on.
-test("frames sent during a mismatch redial buffer into the new session, not the retiring one", async (t) => {
+// so a redial happens with audio already in flight. The retiring session is
+// neither committed (its head would come back as a wrong-language final) nor
+// waited on, so frames sent once the start is handled reach the new session.
+test("frames sent once a mismatch redial starts buffer into the new session, not the retiring one", async (t) => {
   const s = scenario(t);
   await s.invoke("dictation-realtime-warmup", byok({ language: "en" }));
   const started = s.invoke("dictation-realtime-start", byok({ language: "de" }));
@@ -217,8 +217,10 @@ test("a retiring warm session's late events never reach the renderer", async (t)
   await s.invoke("dictation-realtime-warmup", byok({ language: "en" }));
   await s.invoke("dictation-realtime-start", byok({ language: "de" }));
   const [warm] = calls.instances;
+  warm.onPartialTranscript?.("hel");
   warm.onFinalTranscript?.("hello");
   warm.onError?.(new Error("closed"));
+  warm.onSessionEnd?.({ text: "hello" });
   assert.deepEqual(calls.sent, []);
 });
 
@@ -230,7 +232,7 @@ test("a start redials when the warm connection was minted for another model", as
   assert.equal(calls.connects[1].options.model, "gpt-4o-transcribe");
 });
 
-test("a start redials when the warm connection belongs to another provider or mode", async (t) => {
+test("a start redials when the warm connection belongs to another mode", async (t) => {
   const s = scenario(t);
   await s.invoke("dictation-realtime-warmup", byok({ mode: "openwhispr" }));
   await s.invoke("dictation-realtime-start", byok({ mode: "byok" }));
@@ -238,7 +240,7 @@ test("a start redials when the warm connection belongs to another provider or mo
   assert.equal(calls.connects[1].options.preconfigured, false);
 });
 
-test("after stop, the next start dials fresh instead of matching stale options", async (t) => {
+test("after stop, the next start dials fresh", async (t) => {
   const s = scenario(t);
   await s.invoke("dictation-realtime-start", byok());
   await s.invoke("dictation-realtime-stop");

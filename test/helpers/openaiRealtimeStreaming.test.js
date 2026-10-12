@@ -1149,8 +1149,10 @@ test("preconfigured sessions adopt the model the server minted (session.created 
   const connected = streaming.connect({
     apiKey: "cs-secret",
     preconfigured: true,
-    // The desktop's BYOK default; the server decides the managed model.
+    // The desktop's BYOK default; the server decides the managed model and
+    // pins the language when it mints the secret.
     model: "gpt-4o-mini-transcribe",
+    language: "de",
     createSocket: async () => socket,
   });
   await new Promise((resolve) => setImmediate(resolve));
