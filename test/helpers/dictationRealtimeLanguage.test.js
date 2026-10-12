@@ -81,6 +81,7 @@ Module._load = function loadWithMocks(request, parent, isMain) {
     if (request === "./openaiRealtimeStreaming") return FakeRealtimeStreaming;
     if (request === "./realtimeTokenProviders") {
       return {
+        ...originalLoad.call(this, request, parent, isMain),
         fetchRealtimeTokenForProvider: async (provider, _deps, options) => {
           calls.tokens.push({ provider, options });
           return "secret";

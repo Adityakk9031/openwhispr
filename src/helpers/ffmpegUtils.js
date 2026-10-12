@@ -232,6 +232,34 @@ function convertToMp3(inputPath, outputPath, options = {}) {
   );
 }
 
+let reencodeSequence = 0;
+
+// Buffer in, buffer out. convertToWav works on paths, but retry paths hold
+// recordings in memory and should not repeat the temp-file handling.
+async function convertBufferToWav(audioBuffer, options = {}) {
+  const { getSafeTempDir } = require("./safeTempDir");
+  const tempDir = getSafeTempDir();
+  // process.pid is constant within a process and Date.now() only has
+  // millisecond resolution, so concurrent retries need a sequence suffix.
+  const stamp = `${Date.now()}-${process.pid}-${++reencodeSequence}`;
+  const inputPath = path.join(tempDir, `ow-reencode-${stamp}.input`);
+  const outputPath = path.join(tempDir, `ow-reencode-${stamp}.wav`);
+
+  try {
+    fs.writeFileSync(inputPath, audioBuffer);
+    await convertToWav(inputPath, outputPath, { sampleRate: 16000, channels: 1, ...options });
+    return fs.readFileSync(outputPath);
+  } finally {
+    for (const filePath of [inputPath, outputPath]) {
+      try {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      } catch {
+        // A stale temp file should not hide the transcription result or error.
+      }
+    }
+  }
+}
+
 function parseWavFormat(wavBuffer) {
   if (!isWavFormat(wavBuffer)) return null;
 
@@ -249,7 +277,8 @@ function parseWavFormat(wavBuffer) {
       };
     }
 
-    offset += 8 + chunkSize;
+    // RIFF chunks are word-aligned; chunkSize excludes the padding byte.
+    offset += 8 + chunkSize + (chunkSize % 2);
   }
 
   return null;
@@ -289,7 +318,8 @@ function wavToFloat32Samples(wavBuffer) {
       break;
     }
 
-    offset += 8 + chunkSize;
+    // RIFF chunks are word-aligned; chunkSize excludes the padding byte.
+    offset += 8 + chunkSize + (chunkSize % 2);
   }
 
   if (dataOffset < 0) {
@@ -517,6 +547,7 @@ module.exports = {
   parseWavFormat,
   isPcm16Mono16kWav,
   convertToWav,
+  convertBufferToWav,
   convertToMp3,
   splitAudioFile,
   parseFfmpegDuration,
