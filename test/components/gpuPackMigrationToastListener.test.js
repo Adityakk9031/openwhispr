@@ -76,7 +76,25 @@ test("the control panel takes the notice on mount and offers Settings", async (t
   assert.equal(calls.shownDictationPanel, 0, "the control panel never surfaces the pill");
   assert.equal(calls.notifyReady, null, "the control panel doesn't wait to be told");
 
+  assert.equal(toast.duration, 15000);
   toast.actions[0].onClick();
+  assert.equal(calls.openedSection, "speechToText");
+});
+
+test("a notice naming only the llama pack opens AI Models settings", async (t) => {
+  const calls = await mountListener(t, { controlPanel: true, notice: { packs: ["Vulkan llama"] } });
+
+  globalThis.__gpuToasts[0].actions[0].onClick();
+  assert.equal(calls.openedSection, "llms");
+});
+
+test("a notice naming whisper and llama packs opens Speech-to-Text settings", async (t) => {
+  const calls = await mountListener(t, {
+    controlPanel: true,
+    notice: { packs: ["CUDA whisper", "Vulkan llama"] },
+  });
+
+  globalThis.__gpuToasts[0].actions[0].onClick();
   assert.equal(calls.openedSection, "speechToText");
 });
 
@@ -91,6 +109,11 @@ test("the dictation panel takes the notice only when main says so, then surfaces
   assert.equal(calls.takes, 1);
   assert.equal(calls.shownDictationPanel, 1, "a hidden pill is shown so the toast is seen");
   assert.equal(globalThis.__gpuToasts.length, 1);
+  assert.equal(
+    globalThis.__gpuToasts[0].duration,
+    0,
+    "kept until dismissed: a login may be unattended"
+  );
 });
 
 test("a notice another window already took shows nothing", async (t) => {

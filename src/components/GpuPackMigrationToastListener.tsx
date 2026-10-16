@@ -21,7 +21,12 @@ export default function GpuPackMigrationToastListener() {
       const notice = await window.electronAPI?.takeGpuPackMigrationNotice?.();
       if (!notice) return;
 
-      if (!isControlPanelWindow()) void window.electronAPI?.showDictationPanel?.();
+      const inControlPanel = isControlPanelWindow();
+      if (!inControlPanel) void window.electronAPI?.showDictationPanel?.();
+      // The llama pack's card is under AI Models; every other pack is whisper's.
+      const settingsSection = notice.packs.every((pack) => pack.endsWith("llama"))
+        ? "llms"
+        : "speechToText";
       toast({
         title: t("app.toasts.gpuPackMigration.title"),
         description: t("app.toasts.gpuPackMigration.description", {
@@ -32,11 +37,13 @@ export default function GpuPackMigrationToastListener() {
             label: t("providerErrors.openSettings"),
             icon: "settings",
             onClick: () => {
-              void window.electronAPI?.openSettingsSection?.("speechToText");
+              void window.electronAPI?.openSettingsSection?.(settingsSection);
             },
           },
         ],
-        duration: 15000,
+        // An app started to the tray may take the notice at login, before
+        // anyone is looking, so the pill keeps it until it is dismissed.
+        duration: inControlPanel ? 15000 : 0,
       });
     };
 

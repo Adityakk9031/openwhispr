@@ -2,6 +2,7 @@ const fs = require("fs");
 const fsPromises = require("fs").promises;
 const path = require("path");
 const debugLogger = require("./debugLogger");
+const { warnGpuFallback } = require("./gpuFallbackLog");
 const {
   downloadFile,
   createDownloadSignal,
@@ -101,45 +102,48 @@ class WhisperManager {
     return { useCuda, useVulkan };
   }
 
+  // Why a backend the user wants can't be used, or null when it isn't wanted.
+  // Like resolveGpuStartOptions, an unset flag still wants a pack on disk.
+  _gpuFallbackReason(envVar, manager, backend) {
+    const flag = (process.env[envVar] || "").toLowerCase();
+    if (flag === "false") return null;
+    const needsUpdate = !!manager?.needsUpdate?.();
+    const downloaded = !!manager?.isDownloaded?.();
+    if (flag !== "true" && !needsUpdate && !downloaded) return null;
+    if (needsUpdate) return "pack needs update";
+    if (!downloaded) return "pack not installed or missing required libraries";
+    // A wanted, downloaded pack is skipped only after it failed on this machine.
+    return resolveFailedGpuBackends(process.env.WHISPER_GPU_FAILED).includes(backend)
+      ? "previous failure recorded"
+      : null;
+  }
+
   _warnIfGpuFallback() {
     const { useCuda, useVulkan } = this.resolveGpuStartOptions();
-    const failed = resolveFailedGpuBackends(process.env.WHISPER_GPU_FAILED);
-    const cudaExplicit = (process.env.WHISPER_CUDA_ENABLED || "").toLowerCase() === "true";
-    const vulkanExplicit = (process.env.WHISPER_VULKAN_ENABLED || "").toLowerCase() === "true";
+    if (useCuda) return;
+    const runningOn = useVulkan ? "Vulkan" : "CPU";
+    const cudaReason = this._gpuFallbackReason(
+      "WHISPER_CUDA_ENABLED",
+      this._cudaBinaryManager,
+      "cuda"
+    );
+    const vulkanReason = this._gpuFallbackReason(
+      "WHISPER_VULKAN_ENABLED",
+      this._vulkanBinaryManager,
+      "vulkan"
+    );
+    const [label, pack, reason] = cudaReason
+      ? ["CUDA", "CUDA whisper", cudaReason]
+      : ["Vulkan", "Vulkan whisper", vulkanReason];
+    if (!reason) return;
 
-    if (cudaExplicit && !useCuda) {
-      const reason = this._cudaBinaryManager?.needsUpdate?.()
-        ? "pack needs update"
-        : !this._cudaBinaryManager?.isDownloaded?.()
-          ? "pack not installed or missing required libraries"
-          : failed.includes("cuda")
-            ? "previous failure recorded"
-            : "not available";
-      const key = `cuda:${reason}`;
-      if (this._lastGpuFallbackWarning !== key) {
-        this._lastGpuFallbackWarning = key;
-        debugLogger.warn("Whisper CUDA enabled but cannot be used, falling back to CPU", {
-          pack: "CUDA whisper",
-          reason,
-        });
-      }
-    } else if (vulkanExplicit && !useVulkan && !useCuda) {
-      const reason = this._vulkanBinaryManager?.needsUpdate?.()
-        ? "pack needs update"
-        : !this._vulkanBinaryManager?.isDownloaded?.()
-          ? "pack not installed or missing required libraries"
-          : failed.includes("vulkan")
-            ? "previous failure recorded"
-            : "not available";
-      const key = `vulkan:${reason}`;
-      if (this._lastGpuFallbackWarning !== key) {
-        this._lastGpuFallbackWarning = key;
-        debugLogger.warn("Whisper Vulkan enabled but cannot be used, falling back to CPU", {
-          pack: "Vulkan whisper",
-          reason,
-        });
-      }
-    }
+    const key = `${pack}:${reason}:${runningOn}`;
+    if (this._lastGpuFallbackWarning === key) return;
+    this._lastGpuFallbackWarning = key;
+    warnGpuFallback(`Whisper ${label} enabled but cannot be used, falling back to ${runningOn}`, {
+      pack,
+      reason,
+    });
   }
 
   // The pack the settings card describes, so the card never disagrees with the

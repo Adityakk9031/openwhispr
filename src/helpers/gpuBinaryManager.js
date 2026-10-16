@@ -4,6 +4,7 @@ const { createHash } = require("crypto");
 const path = require("path");
 const { app } = require("electron");
 const debugLogger = require("./debugLogger");
+const { warnGpuFallback } = require("./gpuFallbackLog");
 const {
   downloadFile,
   fetchJson,
@@ -89,7 +90,7 @@ class GpuBinaryManager {
       if (missing.length === 0) return binaryPath;
       if (this._lastLoggedMissingLibraries !== missing.join(",")) {
         this._lastLoggedMissingLibraries = missing.join(",");
-        debugLogger.warn("GPU pack binary present but missing required runtime libraries", {
+        warnGpuFallback("GPU pack binary present but missing required runtime libraries", {
           pack: this.config.name,
           binaryPath,
           missingLibraries: missing,

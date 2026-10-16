@@ -72,9 +72,13 @@ function anything() {
   });
 }
 
-function fakeWindow() {
+function fakeWindow({ destroyed = false } = {}) {
   const sent = [];
-  return { sent, isDestroyed: () => false, webContents: { send: (channel) => sent.push(channel) } };
+  return {
+    sent,
+    isDestroyed: () => destroyed,
+    webContents: { send: (channel) => sent.push(channel) },
+  };
 }
 
 let target;
@@ -94,10 +98,12 @@ test.after(() => {
   Module._load = originalLoad;
 });
 
-function setUp({ startedMinimized, controlPanel }) {
+function setUp({ startedMinimized, controlPanel, destroyed = [] }) {
   pendingNotice = { packs: ["CUDA whisper"] };
-  const mainWindow = fakeWindow();
-  const controlPanelWindow = controlPanel ? fakeWindow() : null;
+  const mainWindow = fakeWindow({ destroyed: destroyed.includes("main") });
+  const controlPanelWindow = controlPanel
+    ? fakeWindow({ destroyed: destroyed.includes("controlPanel") })
+    : null;
   target.windowManager = {
     startedMinimized,
     mainWindow,
@@ -160,4 +166,31 @@ test("started to the tray, a control panel opened since takes the notice instead
   assert.deepEqual(mainWindow.sent, []);
   assert.equal(take(mainWindow), null);
   assert.deepEqual(take(controlPanelWindow), { packs: ["CUDA whisper"] });
+});
+
+test("a destroyed control panel hands the notice back to a tray start's pill", () => {
+  const { mainWindow, controlPanelWindow, take, setOnboardingActive } = setUp({
+    startedMinimized: true,
+    controlPanel: true,
+    destroyed: ["controlPanel"],
+  });
+
+  setOnboardingActive(false);
+  assert.deepEqual(mainWindow.sent, ["gpu-pack-migration-notice-ready"]);
+  assert.equal(take(controlPanelWindow), null);
+  assert.deepEqual(take(mainWindow), { packs: ["CUDA whisper"] });
+});
+
+test("destroyed windows are never told about or handed the notice", () => {
+  const { mainWindow, controlPanelWindow, take, setOnboardingActive } = setUp({
+    startedMinimized: true,
+    controlPanel: true,
+    destroyed: ["controlPanel", "main"],
+  });
+
+  setOnboardingActive(false);
+  assert.deepEqual(mainWindow.sent, []);
+  assert.equal(take(controlPanelWindow), null);
+  assert.equal(take(mainWindow), null);
+  assert.deepEqual(pendingNotice, { packs: ["CUDA whisper"] }, "kept for a later window");
 });

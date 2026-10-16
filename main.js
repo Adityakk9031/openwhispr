@@ -564,8 +564,8 @@ function initializeCoreManagers() {
       llamaVulkanManager,
     ]);
     if (clearedPacks.length > 0) {
-      // No window exists yet — persist the notice; a control panel window
-      // shows it as a toast and clears it. See #1606.
+      // No window exists yet — persist the notice; the window that shows it
+      // as a toast takes it (#1606, #2554).
       require("./src/helpers/gpuPackMigrationNotice").record(clearedPacks);
     }
     // The 1.8.3 migration deleted lib-carrying packs without recording that
