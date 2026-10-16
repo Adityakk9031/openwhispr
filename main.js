@@ -588,11 +588,7 @@ function initializeCoreManagers() {
     // (the only mode whose Settings shows the pack) is told.
     const outdatedPacks = detectOutdatedGpuPacks(gpuPacks);
     if (outdatedPacks.length > 0) {
-      const whisperInUse =
-        Boolean(process.env.LOCAL_WHISPER_MODEL) ||
-        process.env.LOCAL_TRANSCRIPTION_PROVIDER === "whisper" ||
-        (process.env.WHISPER_CUDA_ENABLED || "").toLowerCase() === "true" ||
-        (process.env.WHISPER_VULKAN_ENABLED || "").toLowerCase() === "true";
+      const whisperInUse = !!process.env.LOCAL_WHISPER_MODEL;
       debugLogger.info("GPU packs from an older release need re-downloading", {
         packs: outdatedPacks,
         notified: whisperInUse,
@@ -1248,6 +1244,7 @@ async function startApp() {
   const launchedHidden = wasLaunchedAtLoginHidden();
   const startMinimized = environmentManager.getStartMinimized() || launchedHidden;
   if (debugLogger) debugLogger.info("Start minimized", { enabled: startMinimized, launchedHidden });
+  windowManager.startedMinimized = startMinimized;
   await windowManager.createMainWindow();
   await checkStartupHold();
   if (!startMinimized) {

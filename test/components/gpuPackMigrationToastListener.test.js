@@ -8,201 +8,97 @@ const {
   installHookDom,
 } = require("../lib/rendererTestHarness");
 
-const I18N_MOCK = `
-  import en from '/locales/en/translation.json';
-  const t = (key, values = {}) => {
-    let s = key.split('.').reduce((v, k) => v?.[k], en) ?? key;
-    return String(s).replace(/{{(\\w+)}}/g, (_, k) => values[k] ?? '');
-  };
-  export const useTranslation = () => ({ t, i18n: { language: 'en' } });
-`;
-
-test("dictation panel surfaces toast and openSettings action when control panel is not visible", async (t) => {
-  let root = null;
+// Main hands the notice out once (take) to the window that should show it.
+async function mountListener(t, { controlPanel, notice = { packs: ["CUDA whisper"] } }) {
+  let root;
   t.after(async () => {
     if (root) await React.act(async () => root.unmount());
     delete globalThis.__gpuToasts;
   });
-
   globalThis.__gpuToasts = [];
-  let shownDictationPanel = false;
-  let dismissedNotice = false;
-  let openedSection = null;
-
+  const calls = { takes: 0, shownDictationPanel: 0, openedSection: null, notifyReady: null };
+  let remaining = notice;
   installBrowserGlobals(t, {
     window: {
       electronAPI: {
-        isControlPanelVisible: async () => false,
-        getGpuPackMigrationNotice: async () => ({ packs: ["CUDA whisper"] }),
-        showDictationPanel: async () => {
-          shownDictationPanel = true;
+        takeGpuPackMigrationNotice: async () => {
+          calls.takes += 1;
+          const taken = remaining;
+          remaining = null;
+          return taken;
         },
-        dismissGpuPackMigrationNotice: async () => {
-          dismissedNotice = true;
-          return { success: true };
+        onGpuPackMigrationNoticeReady: (callback) => {
+          calls.notifyReady = callback;
+          return () => {
+            calls.notifyReady = null;
+          };
+        },
+        showDictationPanel: async () => {
+          calls.shownDictationPanel += 1;
         },
         openSettingsSection: async (section) => {
-          openedSection = section;
+          calls.openedSection = section;
           return { success: true };
         },
       },
     },
   });
-
   const container = installHookDom(t);
   const vite = await createRendererServer(t, {
     cachePrefix: "openwhispr-gpu-toast-listener-test-",
     noExternal: ["react-i18next"],
     mockModules: {
-      "react-i18next": I18N_MOCK,
-      "/ui/useToast": `
-        export const useToast = () => ({
-          toast: (props) => globalThis.__gpuToasts.push(props)
+      "react-i18next": `
+        export const useTranslation = () => ({
+          t: (key, values) => (values ? key + " " + JSON.stringify(values) : key),
         });
       `,
-      "/utils/windowContext": `
-        export const isDictationPanelWindow = () => true;
+      "/ui/useToast": `
+        export const useToast = () => ({ toast: (props) => globalThis.__gpuToasts.push(props) });
       `,
+      "/utils/windowContext": `export const isControlPanelWindow = () => ${controlPanel};`,
     },
   });
-
-  const { default: GpuPackMigrationToastListener } = await vite.ssrLoadModule(
+  const { default: Listener } = await vite.ssrLoadModule(
     "/components/GpuPackMigrationToastListener.tsx"
   );
-
   root = createRoot(container);
-  await React.act(async () => {
-    root.render(React.createElement(GpuPackMigrationToastListener));
-  });
+  await React.act(async () => root.render(React.createElement(Listener)));
+  return calls;
+}
 
-  // Allow the 800ms cold-start delay in dictation panel
-  await new Promise((resolve) => setTimeout(resolve, 950));
+test("the control panel takes the notice on mount and offers Settings", async (t) => {
+  const calls = await mountListener(t, { controlPanel: true });
 
-  assert.equal(shownDictationPanel, true, "surfaced dictation panel");
-  assert.equal(dismissedNotice, true, "dismissed the notice");
-  assert.equal(globalThis.__gpuToasts.length, 1, "toasted exactly once");
+  assert.equal(globalThis.__gpuToasts.length, 1);
+  const [toast] = globalThis.__gpuToasts;
+  assert.match(toast.description, /CUDA whisper/);
+  assert.equal(calls.shownDictationPanel, 0, "the control panel never surfaces the pill");
+  assert.equal(calls.notifyReady, null, "the control panel doesn't wait to be told");
 
-  const toastProps = globalThis.__gpuToasts[0];
-  assert.match(toastProps.description, /CUDA whisper/);
-  assert.ok(toastProps.actions?.length > 0, "has settings action");
-
-  // Test action opens speechToText
-  await toastProps.actions[0].onClick();
-  assert.equal(openedSection, "speechToText");
+  toast.actions[0].onClick();
+  assert.equal(calls.openedSection, "speechToText");
 });
 
-test("dictation panel does not toast when control panel is already visible", async (t) => {
-  let root = null;
-  t.after(async () => {
-    if (root) await React.act(async () => root.unmount());
-    delete globalThis.__gpuToasts;
-  });
+test("the dictation panel takes the notice only when main says so, then surfaces", async (t) => {
+  const calls = await mountListener(t, { controlPanel: false });
 
-  globalThis.__gpuToasts = [];
-  let shownDictationPanel = false;
-
-  installBrowserGlobals(t, {
-    window: {
-      electronAPI: {
-        isControlPanelVisible: async () => true,
-        getGpuPackMigrationNotice: async () => ({ packs: ["CUDA whisper"] }),
-        showDictationPanel: async () => {
-          shownDictationPanel = true;
-        },
-        dismissGpuPackMigrationNotice: async () => ({ success: true }),
-      },
-    },
-  });
-
-  const container = installHookDom(t);
-  const vite = await createRendererServer(t, {
-    cachePrefix: "openwhispr-gpu-toast-listener-test-",
-    noExternal: ["react-i18next"],
-    mockModules: {
-      "react-i18next": I18N_MOCK,
-      "/ui/useToast": `
-        export const useToast = () => ({
-          toast: (props) => globalThis.__gpuToasts.push(props)
-        });
-      `,
-      "/utils/windowContext": `
-        export const isDictationPanelWindow = () => true;
-      `,
-    },
-  });
-
-  const { default: GpuPackMigrationToastListener } = await vite.ssrLoadModule(
-    "/components/GpuPackMigrationToastListener.tsx"
-  );
-
-  root = createRoot(container);
-  await React.act(async () => {
-    root.render(React.createElement(GpuPackMigrationToastListener));
-  });
-
-  await new Promise((resolve) => setTimeout(resolve, 950));
-
-  assert.equal(shownDictationPanel, false);
+  assert.equal(calls.takes, 0, "nothing is taken before main says the normal app is up");
   assert.equal(globalThis.__gpuToasts.length, 0);
+
+  await React.act(async () => calls.notifyReady());
+
+  assert.equal(calls.takes, 1);
+  assert.equal(calls.shownDictationPanel, 1, "a hidden pill is shown so the toast is seen");
+  assert.equal(globalThis.__gpuToasts.length, 1);
 });
 
-test("control panel toasts immediately without waiting or calling showDictationPanel", async (t) => {
-  let root = null;
-  t.after(async () => {
-    if (root) await React.act(async () => root.unmount());
-    delete globalThis.__gpuToasts;
-  });
+test("a notice another window already took shows nothing", async (t) => {
+  const calls = await mountListener(t, { controlPanel: false, notice: null });
 
-  globalThis.__gpuToasts = [];
-  let shownDictationPanel = false;
-  let dismissedNotice = false;
+  await React.act(async () => calls.notifyReady());
 
-  installBrowserGlobals(t, {
-    window: {
-      electronAPI: {
-        getGpuPackMigrationNotice: async () => ({ packs: ["Vulkan whisper"] }),
-        showDictationPanel: async () => {
-          shownDictationPanel = true;
-        },
-        dismissGpuPackMigrationNotice: async () => {
-          dismissedNotice = true;
-          return { success: true };
-        },
-      },
-    },
-  });
-
-  const container = installHookDom(t);
-  const vite = await createRendererServer(t, {
-    cachePrefix: "openwhispr-gpu-toast-listener-test-",
-    noExternal: ["react-i18next"],
-    mockModules: {
-      "react-i18next": I18N_MOCK,
-      "/ui/useToast": `
-        export const useToast = () => ({
-          toast: (props) => globalThis.__gpuToasts.push(props)
-        });
-      `,
-      "/utils/windowContext": `
-        export const isDictationPanelWindow = () => false;
-      `,
-    },
-  });
-
-  const { default: GpuPackMigrationToastListener } = await vite.ssrLoadModule(
-    "/components/GpuPackMigrationToastListener.tsx"
-  );
-
-  root = createRoot(container);
-  await React.act(async () => {
-    root.render(React.createElement(GpuPackMigrationToastListener));
-  });
-
-  // Control panel toasts immediately (microtask)
-  await new Promise((resolve) => setTimeout(resolve, 50));
-
-  assert.equal(shownDictationPanel, false, "control panel never calls showDictationPanel");
-  assert.equal(dismissedNotice, true, "dismissed the notice");
-  assert.equal(globalThis.__gpuToasts.length, 1, "toasted immediately");
-  assert.match(globalThis.__gpuToasts[0].description, /Vulkan whisper/);
+  assert.equal(calls.takes, 1);
+  assert.equal(calls.shownDictationPanel, 0);
+  assert.equal(globalThis.__gpuToasts.length, 0);
 });
