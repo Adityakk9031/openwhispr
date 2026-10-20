@@ -356,6 +356,56 @@ for (const { owner, x11, wlPaste, saved } of [
   });
 }
 
+// A rich or image restore writes X11 only, so on KWin before 6.0.3 the text the app put on
+// Wayland stays there, and the next KDE save would take it for a newer copy.
+const RICH_COPY = { formats: ["text/html", "text/plain"], text: "user copy", html: "<b>user</b>" };
+for (const { original, x11, when, writeAppText } of [
+  {
+    original: "rich",
+    x11: RICH_COPY,
+    when: "a dictation",
+    writeAppText: (manager) => manager._writeClipboardWayland("dictated text"),
+  },
+  {
+    original: "rich",
+    x11: RICH_COPY,
+    when: "a selection capture",
+    writeAppText: (manager) => manager._writeClipboardTextAll("__OPENWHISPR_SELECTION_test__"),
+  },
+  {
+    original: "image",
+    x11: { formats: ["image/png"], image: nonEmptyImage },
+    when: "a dictation",
+    writeAppText: (manager) => manager._writeClipboardWayland("dictated text"),
+  },
+]) {
+  test(`a KDE ${original} clipboard restored after ${when} is saved again unchanged`, async (t) => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { value: "linux" });
+    t.after(() => Object.defineProperty(process, "platform", platform));
+    resetClipboard(x11);
+    let waylandText = x11.text ?? null;
+    const Manager = loadClipboardManager({
+      spawnSync: (command, args) => {
+        if (command === "wl-copy" && !args.includes("--primary")) waylandText = args.at(-1);
+        return waylandText === null
+          ? { status: 1, stdout: Buffer.from("") }
+          : { status: 0, stdout: Buffer.from(waylandText) };
+      },
+    });
+    const manager = new Manager();
+    manager.commandExists = (command) => command === "wl-copy" || command === "wl-paste";
+
+    await withWaylandEnvironment("KDE", () => {
+      const saved = manager._saveClipboard();
+      writeAppText(manager);
+      manager._restoreClipboard(saved);
+
+      assert.deepEqual(manager._saveClipboard(), saved);
+    });
+  });
+}
+
 test("an empty clipboard on X11 is saved without asking wl-paste", async (t) => {
   const platform = Object.getOwnPropertyDescriptor(process, "platform");
   Object.defineProperty(process, "platform", { value: "linux" });

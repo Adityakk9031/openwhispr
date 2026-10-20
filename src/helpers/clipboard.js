@@ -862,6 +862,11 @@ class ClipboardManager {
 
   _restoreClipboard(original) {
     if (!original) return;
+    // The KDE save trusts Wayland text that differs from X11's, so replace the transcript or
+    // sentinel left there. X11 goes last, so KWin 6.0.3+ bridges the rich original to Wayland.
+    if (original.type !== "text" && getLinuxSessionInfo().isKde) {
+      this._writeClipboardWayland(original.data.text ?? "");
+    }
     if (original.type === "formats") {
       clipboard.write(original.data);
     } else if (original.type === "image") {
