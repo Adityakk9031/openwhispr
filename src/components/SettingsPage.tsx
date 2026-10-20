@@ -3809,7 +3809,7 @@ EOF`,
                       key: "hasWlCopy",
                       label: "wl-copy",
                       ok: ydotoolStatus.hasWlCopy,
-                      required: ydotoolStatus.requiresWlCopy,
+                      required: ydotoolStatus.requiresWlCopy || ydotoolStatus.isKde,
                       desc: t("settingsPage.general.waylandPaste.wlCopyDesc"),
                       steps: [
                         {

@@ -840,9 +840,10 @@ class ClipboardManager {
     }
 
     const keys = Object.keys(data);
-    // A Wayland app's copy leaves an older X11 owner in place on KWin before 6.0.3,
+    // A Wayland app's copy can leave an older X11 owner in place on KWin,
     // and the KDE restore writes the Wayland clipboard too. Plain text only: `--type text`
-    // falls back to the html that Chromium offers with a copied image.
+    // falls back to the html that Chromium offers with a copied image. A Wayland-only copy
+    // with no plain text (a Spectacle screenshot) isn't saved, so it comes back as X11's text.
     if (keys.length > 0 && getLinuxSessionInfo().isKde) {
       const waylandText = this._readWaylandClipboardText("text/plain;charset=utf-8");
       if (waylandText && waylandText !== text) return { type: "text", data: waylandText };

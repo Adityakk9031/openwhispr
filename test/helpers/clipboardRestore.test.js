@@ -17,13 +17,14 @@ const fakeClipboard = {
   readText() {
     return this.text;
   },
-  writeText(text) {
+  writeText(text, type) {
+    this.writes.push(["writeText", text, type]);
+    if (type === "selection") return;
     this.text = text;
     this.html = "";
     this.rtf = "";
     this.image = null;
     this.formats = ["text/plain"];
-    this.writes.push(["writeText", text]);
   },
   readHTML() {
     return this.html;
@@ -303,7 +304,7 @@ test("a clipboard XWayland can read is saved without asking wl-paste", async (t)
   assert.deepEqual(spawnSyncCalls, []);
 });
 
-// KWin before 6.0.3 leaves an older X11 owner in place after a Wayland app copies, so
+// KWin can leave an older X11 owner in place after a Wayland app copies, so
 // the X11 clipboard can be older than the Wayland one the KDE restore writes. A current
 // X11 owner's text is what wl-paste reads, and an image has no plain text to read, even
 // with the html Chromium offers beside it.
@@ -417,6 +418,21 @@ for (const { original, x11, when, writeAppText } of [
     });
   });
 }
+
+test("a rich or image restore off KDE writes X11 only", async () => {
+  const spawnSyncCalls = [];
+  const Manager = loadClipboardManager({ spawnSync: createSpawnSync(spawnSyncCalls) });
+  const manager = new Manager();
+  manager.commandExists = (command) => command === "wl-copy";
+  resetClipboard();
+
+  await withWaylandEnvironment("GNOME", () => {
+    manager._restoreClipboard({ type: "formats", data: RICH_COPY });
+    manager._restoreClipboard({ type: "image", data: nonEmptyImage });
+  });
+
+  assert.deepEqual(spawnSyncCalls, []);
+});
 
 test("an empty clipboard on X11 is saved without asking wl-paste", async (t) => {
   const platform = Object.getOwnPropertyDescriptor(process, "platform");
@@ -1791,5 +1807,5 @@ test("_writePrimarySelection on KDE mirrors wl-copy to Electron's X11 selection"
     spawnSyncCalls.map((call) => [call.command, call.args]),
     [["wl-copy", ["--primary", "--", "selection text"]]]
   );
-  assert.deepEqual(fakeClipboard.writes, [["writeText", "selection text"]]);
+  assert.deepEqual(fakeClipboard.writes, [["writeText", "selection text", "selection"]]);
 });
