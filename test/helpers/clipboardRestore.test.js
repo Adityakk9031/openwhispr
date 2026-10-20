@@ -303,23 +303,58 @@ test("a clipboard XWayland can read is saved without asking wl-paste", async (t)
   assert.deepEqual(spawnSyncCalls, []);
 });
 
-// KWin before 6.0.3 keeps this app as the X11 owner after a Wayland app copies, so
-// the X11 text can be older than the Wayland clipboard the KDE restore writes.
-test("a KDE text clipboard is saved from the Wayland side over a stale X11 read", async (t) => {
-  const platform = Object.getOwnPropertyDescriptor(process, "platform");
-  Object.defineProperty(process, "platform", { value: "linux" });
-  t.after(() => Object.defineProperty(process, "platform", platform));
-  resetClipboard({ text: "stale X11 text" });
-  const Manager = loadClipboardManager({
-    spawnSync: () => ({ status: 0, stdout: Buffer.from("copied in a Wayland app") }),
+// KWin before 6.0.3 leaves an older X11 owner in place after a Wayland app copies, so
+// the X11 clipboard can be older than the Wayland one the KDE restore writes. A current
+// X11 owner's text is what wl-paste reads, and an image has no text to read.
+const WAYLAND_COPY = { status: 0, stdout: "copied in a Wayland app" };
+for (const { owner, x11, wlPaste, saved } of [
+  {
+    owner: "a stale X11 text owner",
+    x11: { text: "stale X11 text" },
+    wlPaste: WAYLAND_COPY,
+    saved: { type: "text", data: WAYLAND_COPY.stdout },
+  },
+  {
+    owner: "a stale X11 rich-text owner",
+    x11: { formats: ["text/html", "text/plain"], text: "stale X11 text", html: "<b>stale</b>" },
+    wlPaste: WAYLAND_COPY,
+    saved: { type: "text", data: WAYLAND_COPY.stdout },
+  },
+  {
+    owner: "a stale X11 image owner",
+    x11: { formats: ["image/png"], image: nonEmptyImage },
+    wlPaste: WAYLAND_COPY,
+    saved: { type: "text", data: WAYLAND_COPY.stdout },
+  },
+  {
+    owner: "a current rich-text owner",
+    x11: { formats: ["text/html", "text/plain"], text: "current", html: "<b>current</b>" },
+    wlPaste: { status: 0, stdout: "current" },
+    saved: { type: "formats", data: { text: "current", html: "<b>current</b>" } },
+  },
+  {
+    owner: "a current image owner",
+    x11: { formats: ["image/png"], image: nonEmptyImage },
+    wlPaste: { status: 1, stdout: "" },
+    saved: { type: "image", data: nonEmptyImage },
+  },
+]) {
+  test(`a KDE clipboard held by ${owner} is saved as ${saved.type}`, async (t) => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { value: "linux" });
+    t.after(() => Object.defineProperty(process, "platform", platform));
+    resetClipboard(x11);
+    const Manager = loadClipboardManager({
+      spawnSync: () => ({ status: wlPaste.status, stdout: Buffer.from(wlPaste.stdout) }),
+    });
+    const manager = new Manager();
+    manager.commandExists = (command) => command === "wl-paste";
+
+    const snapshot = await withWaylandEnvironment("KDE", () => manager._saveClipboard());
+
+    assert.deepEqual(snapshot, saved);
   });
-  const manager = new Manager();
-  manager.commandExists = (command) => command === "wl-paste";
-
-  const snapshot = await withWaylandEnvironment("KDE", () => manager._saveClipboard());
-
-  assert.deepEqual(snapshot, { type: "text", data: "copied in a Wayland app" });
-});
+}
 
 test("an empty clipboard on X11 is saved without asking wl-paste", async (t) => {
   const platform = Object.getOwnPropertyDescriptor(process, "platform");
