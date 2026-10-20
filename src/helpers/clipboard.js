@@ -256,11 +256,11 @@ class ClipboardManager {
     return null;
   }
 
-  // `--type text` so a copied image never comes back as raw bytes.
-  _readWaylandClipboardText() {
+  // A text type, so a copied image never comes back as raw bytes.
+  _readWaylandClipboardText(type = "text") {
     if (!this._isWayland() || !this.commandExists("wl-paste")) return null;
     try {
-      const result = spawnSync("wl-paste", ["--no-newline", "--type", "text"], { timeout: 200 });
+      const result = spawnSync("wl-paste", ["--no-newline", "--type", type], { timeout: 200 });
       if (result.status === 0) return result.stdout.toString();
     } catch {}
     return null;
@@ -841,9 +841,10 @@ class ClipboardManager {
 
     const keys = Object.keys(data);
     // A Wayland app's copy leaves an older X11 owner in place on KWin before 6.0.3,
-    // and the KDE restore writes the Wayland clipboard too.
+    // and the KDE restore writes the Wayland clipboard too. Plain text only: `--type text`
+    // falls back to the html that Chromium offers with a copied image.
     if (keys.length > 0 && getLinuxSessionInfo().isKde) {
-      const waylandText = this._readWaylandClipboardText();
+      const waylandText = this._readWaylandClipboardText("text/plain;charset=utf-8");
       if (waylandText && waylandText !== text) return { type: "text", data: waylandText };
     }
     if (keys.length === 1 && keys[0] === "image") {

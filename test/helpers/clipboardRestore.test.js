@@ -305,38 +305,46 @@ test("a clipboard XWayland can read is saved without asking wl-paste", async (t)
 
 // KWin before 6.0.3 leaves an older X11 owner in place after a Wayland app copies, so
 // the X11 clipboard can be older than the Wayland one the KDE restore writes. A current
-// X11 owner's text is what wl-paste reads, and an image has no text to read.
-const WAYLAND_COPY = { status: 0, stdout: "copied in a Wayland app" };
-for (const { owner, x11, wlPaste, saved } of [
+// X11 owner's text is what wl-paste reads, and an image has no plain text to read, even
+// with the html Chromium offers beside it.
+const WAYLAND_COPY = "copied in a Wayland app";
+const IMAGE_MARKUP = '<img src="https://example.com/a.png">';
+for (const { owner, x11, wayland, saved } of [
   {
     owner: "a stale X11 text owner",
     x11: { text: "stale X11 text" },
-    wlPaste: WAYLAND_COPY,
-    saved: { type: "text", data: WAYLAND_COPY.stdout },
+    wayland: { plain: WAYLAND_COPY },
+    saved: { type: "text", data: WAYLAND_COPY },
   },
   {
     owner: "a stale X11 rich-text owner",
     x11: { formats: ["text/html", "text/plain"], text: "stale X11 text", html: "<b>stale</b>" },
-    wlPaste: WAYLAND_COPY,
-    saved: { type: "text", data: WAYLAND_COPY.stdout },
+    wayland: { plain: WAYLAND_COPY },
+    saved: { type: "text", data: WAYLAND_COPY },
   },
   {
     owner: "a stale X11 image owner",
     x11: { formats: ["image/png"], image: nonEmptyImage },
-    wlPaste: WAYLAND_COPY,
-    saved: { type: "text", data: WAYLAND_COPY.stdout },
+    wayland: { plain: WAYLAND_COPY },
+    saved: { type: "text", data: WAYLAND_COPY },
   },
   {
     owner: "a current rich-text owner",
     x11: { formats: ["text/html", "text/plain"], text: "current", html: "<b>current</b>" },
-    wlPaste: { status: 0, stdout: "current" },
+    wayland: { plain: "current" },
     saved: { type: "formats", data: { text: "current", html: "<b>current</b>" } },
   },
   {
     owner: "a current image owner",
     x11: { formats: ["image/png"], image: nonEmptyImage },
-    wlPaste: { status: 1, stdout: "" },
+    wayland: {},
     saved: { type: "image", data: nonEmptyImage },
+  },
+  {
+    owner: "a Chromium copied image",
+    x11: { formats: ["image/png", "text/html"], html: IMAGE_MARKUP, image: nonEmptyImage },
+    wayland: { html: IMAGE_MARKUP },
+    saved: { type: "formats", data: { html: IMAGE_MARKUP, image: nonEmptyImage } },
   },
 ]) {
   test(`a KDE clipboard held by ${owner} is saved as ${saved.type}`, async (t) => {
@@ -344,8 +352,12 @@ for (const { owner, x11, wlPaste, saved } of [
     Object.defineProperty(process, "platform", { value: "linux" });
     t.after(() => Object.defineProperty(process, "platform", platform));
     resetClipboard(x11);
+    // `--type text` falls back to any text type; an exact type matches only itself.
     const Manager = loadClipboardManager({
-      spawnSync: () => ({ status: wlPaste.status, stdout: Buffer.from(wlPaste.stdout) }),
+      spawnSync: (command, args) => {
+        const text = args.at(-1) === "text" ? (wayland.plain ?? wayland.html) : wayland.plain;
+        return { status: text === undefined ? 1 : 0, stdout: Buffer.from(text ?? "") };
+      },
     });
     const manager = new Manager();
     manager.commandExists = (command) => command === "wl-paste";
