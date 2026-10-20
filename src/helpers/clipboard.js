@@ -159,47 +159,22 @@ class ClipboardManager {
   // True when wl-copy wrote the Wayland clipboard; every other path only reaches
   // XWayland's.
   _writeClipboardWayland(text, webContents) {
-    const { isKde } = getLinuxSessionInfo();
-
-    let wlCopySucceeded = false;
     if (this._wlCopyExists()) {
       try {
         const result = spawnWlCopy([], text);
         if (result.status === 0) {
-          wlCopySucceeded = true;
+          clipboard.writeText(text);
+          return true;
         }
       } catch {}
     }
 
-    // On KDE with XWayland, write to X11 clipboard as well because
-    // wl-copy targets the Wayland clipboard which can be desynced from X11.
-    // Writing to both ensures native Wayland apps (e.g. Chromium, Firefox,
-    // Kate, Konsole) and XWayland apps both receive the text.
-    if (isKde) {
-      if (this.commandExists("xclip")) {
-        try {
-          spawnSync("xclip", ["-selection", "clipboard"], {
-            input: text,
-            timeout: 200,
-          });
-        } catch {}
-      }
-      if (this.commandExists("xsel")) {
-        try {
-          spawnSync("xsel", ["--clipboard", "--input"], {
-            input: text,
-            timeout: 200,
-          });
-        } catch {}
-      }
-    }
-
-    if (!wlCopySucceeded && webContents && !webContents.isDestroyed()) {
+    if (webContents && !webContents.isDestroyed()) {
       writeClipboardInRenderer(webContents, text).catch(() => {});
     }
 
     clipboard.writeText(text);
-    return wlCopySucceeded;
+    return false;
   }
 
   // PRIMARY selection (X11's "highlight to copy") is what terminals like alacritty,
@@ -212,13 +187,13 @@ class ClipboardManager {
     const { isWayland, isKde } = getLinuxSessionInfo();
     if (process.platform !== "linux" && !isWayland) return false;
 
-    let wlCopySucceeded = false;
     if (isWayland && this.commandExists("wl-copy")) {
       try {
         const result = spawnWlCopy(["--primary"], text);
         if (result.status === 0) {
-          wlCopySucceeded = true;
-          if (!isKde) return true;
+          // KDE can leave XWayland's selection out of sync with Wayland's, so write both.
+          if (isKde) clipboard.writeText(text, "selection");
+          return true;
         }
       } catch {}
     }
@@ -229,7 +204,7 @@ class ClipboardManager {
           input: text,
           timeout: 200,
         });
-        if (result.status === 0 && !isKde) return false;
+        if (result.status === 0) return false;
       } catch {}
     }
 
@@ -239,14 +214,14 @@ class ClipboardManager {
           input: text,
           timeout: 200,
         });
-        if (result.status === 0 && !isKde) return false;
+        if (result.status === 0) return false;
       } catch {}
     }
 
     try {
       clipboard.writeText(text, "selection");
     } catch {}
-    return wlCopySucceeded;
+    return false;
   }
 
   _readPrimarySelection() {
