@@ -1,7 +1,10 @@
 import React from "react";
 import { useTranslation } from "react-i18next";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
-import { X } from "lucide-react";
+import { X } from "../icons";
+import { cn } from "../lib/utils";
+import { blurBehindOverlays } from "./overlayBlur";
+import { InfoBox } from "./InfoBox";
 import { SettingsLayoutProvider } from "./useSettingsLayout";
 import { useDismissGuard } from "./useDismissGuard";
 
@@ -28,6 +31,12 @@ interface SidebarModalProps<T extends string> {
   version?: string;
   /** Rendered above the nav (hidden in compact mode), e.g. account identity. */
   header?: React.ReactNode;
+  /**
+   * Account-level notice, e.g. an organization-managed policy. Sits under the
+   * header in the sidebar; when the sidebar is compact it collapses to an icon
+   * badge beside the close button with `description` as its tooltip.
+   */
+  notice?: { icon: React.ReactNode; label: string; description: string };
 }
 
 export default function SidebarModal<T extends string>({
@@ -41,6 +50,7 @@ export default function SidebarModal<T extends string>({
   sidebarWidth = "w-52",
   version,
   header,
+  notice,
 }: SidebarModalProps<T>) {
   const { t } = useTranslation();
   const { registerContent, shouldBlockDismiss } = useDismissGuard<HTMLDivElement>();
@@ -84,12 +94,12 @@ export default function SidebarModal<T extends string>({
     if (!item.badge && item.badgeVariant !== "dot") return null;
 
     if (item.badgeVariant === "dot") {
-      return <span className="ml-auto h-1.5 w-1.5 rounded-full bg-primary shrink-0" />;
+      return <span className="ms-auto h-1.5 w-1.5 rounded-full bg-primary shrink-0" />;
     }
 
     return (
       <span
-        className={`ml-auto text-xs font-semibold uppercase tracking-wider px-1.5 py-px rounded-sm shrink-0 ${
+        className={`ms-auto text-xs font-semibold uppercase tracking-wider px-1.5 py-px rounded-sm shrink-0 ${
           item.badgeVariant === "new"
             ? "bg-primary/10 text-primary dark:bg-primary/15"
             : item.badgeVariant === "update"
@@ -107,9 +117,20 @@ export default function SidebarModal<T extends string>({
   return (
     <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
       <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0" />
+        <DialogPrimitive.Overlay
+          className={cn(
+            "fixed inset-0 z-50 bg-black/60 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
+            blurBehindOverlays && "backdrop-blur-sm"
+          )}
+        />
         <DialogPrimitive.Content
           ref={registerContent}
+          // Radix focuses the first tabbable on open, which is the close button;
+          // focus the dialog itself so the X doesn't open wearing a focus ring.
+          onOpenAutoFocus={(e) => {
+            e.preventDefault();
+            (e.currentTarget as HTMLElement).focus();
+          }}
           onEscapeKeyDown={(e) => {
             if (document.querySelector("[data-capturing]")) e.preventDefault();
           }}
@@ -119,23 +140,44 @@ export default function SidebarModal<T extends string>({
             // otherwise take the whole settings modal with it.
             if (shouldBlockDismiss(e)) e.preventDefault();
           }}
-          className="fixed left-[50%] top-[50%] z-50 max-h-[85vh] w-[90vw] max-w-4xl translate-x-[-50%] translate-y-[-50%] rounded-xl p-0 overflow-hidden bg-background border border-border shadow-[0_25px_50px_-12px_rgba(0,0,0,0.25)] dark:bg-surface-1 dark:border-border-subtle dark:shadow-[0_25px_60px_-12px_rgba(0,0,0,0.5),0_0_0_1px_rgba(255,255,255,0.05)] duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-98 data-[state=open]:zoom-in-98"
+          className="fixed left-[50%] top-[50%] z-50 max-h-[85vh] w-[90vw] max-w-4xl translate-x-[-50%] translate-y-[-50%] rounded-xl p-0 overflow-hidden outline-none bg-background border border-border shadow-[0_25px_50px_-12px_rgba(0,0,0,0.25)] dark:bg-surface-1 dark:border-border-subtle dark:shadow-[0_25px_60px_-12px_rgba(0,0,0,0.5),0_0_0_1px_rgba(255,255,255,0.05)] duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-98 data-[state=open]:zoom-in-98"
         >
           <div className="relative h-full max-h-[85vh] overflow-hidden">
-            <DialogPrimitive.Close className="absolute right-4 top-4 z-10 rounded-md p-1.5 opacity-40 ring-offset-background transition-[opacity,background-color] hover:opacity-100 bg-transparent hover:bg-muted dark:hover:bg-surface-raised focus:outline-none focus:ring-2 focus:ring-ring/30 focus:ring-offset-1">
-              <X className="h-3.5 w-3.5 text-muted-foreground" />
-              <span className="sr-only">{t("common.close")}</span>
-            </DialogPrimitive.Close>
+            <div className="absolute end-4 top-4 z-10 flex items-center gap-2">
+              {notice && isCompact && (
+                <InfoBox title={notice.description} className="rounded-md p-1.25 text-primary">
+                  {notice.icon}
+                  <span className="sr-only">{notice.description}</span>
+                </InfoBox>
+              )}
+              <DialogPrimitive.Close className="rounded-md p-1.5 opacity-40 ring-offset-background transition-[opacity,background-color] hover:opacity-100 bg-transparent hover:bg-muted dark:hover:bg-surface-raised outline-none focus-visible:ring-2 focus-visible:ring-ring/30 focus-visible:ring-offset-1">
+                <X className="h-3.5 w-3.5 text-muted-foreground" />
+                <span className="sr-only">{t("common.close")}</span>
+              </DialogPrimitive.Close>
+            </div>
 
             <div ref={containerRef} className="flex h-[85vh]">
               <DialogPrimitive.Title className="sr-only">{title}</DialogPrimitive.Title>
 
               {/* Sidebar */}
               <div
-                className={`${actualSidebarWidth} shrink-0 border-r border-border/40 dark:border-border-subtle flex flex-col bg-surface-1 dark:bg-surface-0 transition-[width] duration-200 ease-out`}
+                className={`${actualSidebarWidth} shrink-0 border-e border-border/70 dark:border-border-subtle flex flex-col bg-surface-1 dark:bg-surface-0 transition-[width] duration-200 ease-out`}
               >
                 {/* Identity / custom header */}
                 {header && !isCompact && <div className="px-4 pt-5 pb-1">{header}</div>}
+                {notice && !isCompact && (
+                  <div className="flex justify-center px-4 pb-1">
+                    <span
+                      aria-hidden="true"
+                      title={notice.description}
+                      className="inline-flex items-center gap-1.5 text-center text-[11px] text-primary"
+                    >
+                      {notice.icon}
+                      {notice.label}
+                    </span>
+                    <span className="sr-only">{notice.description}</span>
+                  </div>
+                )}
 
                 {/* Navigation */}
                 <nav
@@ -163,7 +205,7 @@ export default function SidebarModal<T extends string>({
                               data-section-id={item.id}
                               onClick={() => onSectionChange(item.id)}
                               title={isCompact ? item.label : undefined}
-                              className={`group relative w-full flex items-center text-left text-xs rounded-md transition-colors duration-100 outline-none ${
+                              className={`group relative w-full flex items-center text-start text-xs rounded-md transition-colors duration-100 outline-none ${
                                 isCompact ? "justify-center px-0 py-2" : "gap-2 px-2 py-1.5"
                               } ${
                                 isActive
@@ -187,14 +229,17 @@ export default function SidebarModal<T extends string>({
                                   </span>
                                   {renderBadge(item)}
                                   {item.shortcut && !item.badge && (
-                                    <kbd className="ml-auto text-xs text-muted-foreground/25 font-mono shrink-0">
+                                    <kbd
+                                      dir="ltr"
+                                      className="ms-auto text-xs text-muted-foreground/70 font-mono shrink-0"
+                                    >
                                       {item.shortcut}
                                     </kbd>
                                   )}
                                 </>
                               )}
                               {isCompact && item.badgeVariant === "dot" && (
-                                <span className="absolute top-1.5 right-1.5 h-1.5 w-1.5 rounded-full bg-primary" />
+                                <span className="absolute top-1.5 end-1.5 h-1.5 w-1.5 rounded-full bg-primary" />
                               )}
                             </button>
                           );
@@ -207,14 +252,17 @@ export default function SidebarModal<T extends string>({
                 {/* Footer / version */}
                 {version && (
                   <div
-                    className={`border-t border-border/20 dark:border-border-subtle ${
+                    className={`border-t border-border/70 dark:border-border-subtle ${
                       isCompact ? "flex justify-center py-2.5" : "px-3 py-2.5"
                     }`}
                   >
                     <div className="flex items-center gap-1.5">
                       <div className="h-1 w-1 rounded-full bg-success/60" />
                       {!isCompact && (
-                        <span className="text-xs text-muted-foreground/40 tabular-nums tracking-wide">
+                        <span
+                          dir="ltr"
+                          className="text-xs text-muted-foreground/70 tabular-nums tracking-wide"
+                        >
                           v{version}
                         </span>
                       )}
@@ -226,7 +274,9 @@ export default function SidebarModal<T extends string>({
               {/* Main Content */}
               <div className="flex-1 overflow-y-auto bg-background dark:bg-surface-1">
                 <SettingsLayoutProvider value={{ isCompact }}>
-                  <div className={isCompact ? "p-4" : "p-6"}>{children}</div>
+                  {/* The close button (and compact notice badge) float over this column's top corner
+                      (top-4, 26px tall); pt-[22px] centres a text-xs heading (line-height 1.15) on that row. */}
+                  <div className={`${isCompact ? "p-4" : "p-6"} pt-[22px]`}>{children}</div>
                 </SettingsLayoutProvider>
               </div>
             </div>

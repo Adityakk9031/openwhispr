@@ -5,6 +5,7 @@ const path = require("node:path");
 const React = require("react");
 const { renderToStaticMarkup } = require("react-dom/server");
 const {
+  SIGNED_OUT_AUTH_MOCK,
   createRendererServer,
   installBrowserGlobals,
   installHookDom,
@@ -57,6 +58,7 @@ async function renderChatStreaming(
   const container = live ? installHookDom(t) : null;
   const vite = await createRendererServer(t, {
     cachePrefix: "openwhispr-chat-streaming-cancellation-test-",
+    mockModules: SIGNED_OUT_AUTH_MOCK,
   });
   const [{ default: viteI18next }, { initReactI18next }] = await Promise.all([
     vite.ssrLoadModule("i18next"),
@@ -335,7 +337,9 @@ test("an unmount mid-stream persists the partial reply without delivering it", a
 
   let completionCalls = 0;
   let sendPromise;
-  const waitForMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
+  // The hook flushes streamed text to state on a short timer, so the partial
+  // token lands on real time, not on the next microtask.
+  const waitForFlush = () => new Promise((resolve) => setTimeout(resolve, 10));
   await React.act(async () => {
     sendPromise = captured.sendToAI("hello", [], {
       onComplete: () => {
@@ -347,7 +351,7 @@ test("an unmount mid-stream persists the partial reply without delivering it", a
       i < 50 && !getMessages().some((m) => m.content === "Partial reply");
       i++
     ) {
-      await waitForMicrotasks();
+      await waitForFlush();
     }
   });
   assert.ok(

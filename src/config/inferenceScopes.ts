@@ -1,4 +1,5 @@
 import type { SettingsState } from "../stores/settingsStore";
+import type { CloudReasonPurpose } from "../types/electron";
 
 export interface InferenceScopeStoreKeys {
   mode: keyof SettingsState;
@@ -9,15 +10,28 @@ export interface InferenceScopeStoreKeys {
   remoteUrl?: keyof SettingsState;
   customApiKey?: keyof SettingsState;
   disableThinking?: keyof SettingsState;
+  reasoningEffort?: keyof SettingsState;
 }
 
 export interface InferenceScopeDefinition {
   storeKeys: InferenceScopeStoreKeys;
   fallbackScope?: string;
+  /** Server-side fallback chain OpenWhispr Cloud answers this scope on. */
+  cloudPurpose: CloudReasonPurpose;
+  /**
+   * Inert until the user picks its own model, inheriting the fallback scope
+   * meanwhile. Policy never invents that choice, and a policy that moves the
+   * chosen provider clears the model so the override asks to be picked again:
+   * an invented target would switch the override on and capture requests for
+   * a provider with no key. Only for scopes whose every offered mode needs a
+   * model, since a cloud mode counts as chosen with none.
+   */
+  optional?: true;
 }
 
 export const INFERENCE_SCOPES = {
   dictationCleanup: {
+    cloudPurpose: "cleanup",
     storeKeys: {
       mode: "cleanupMode",
       provider: "cleanupProvider",
@@ -27,9 +41,11 @@ export const INFERENCE_SCOPES = {
       remoteUrl: "cleanupRemoteUrl",
       customApiKey: "cleanupCustomApiKey",
       disableThinking: "cleanupDisableThinking",
+      reasoningEffort: "cleanupReasoningEffort",
     },
   },
   dictationAgent: {
+    cloudPurpose: "assistant",
     storeKeys: {
       mode: "dictationAgentMode",
       provider: "dictationAgentProvider",
@@ -39,12 +55,14 @@ export const INFERENCE_SCOPES = {
       remoteUrl: "dictationAgentRemoteUrl",
       customApiKey: "dictationAgentCustomApiKey",
       disableThinking: "dictationAgentDisableThinking",
+      reasoningEffort: "dictationAgentReasoningEffort",
     },
   },
   // Optional override used only when a voice-agent request carries a screen
   // context screenshot. Unset fields resolve to the dictationAgent scope, and
   // the UI offers only cloud/BYOK modes, so remoteUrl is deliberately absent.
   dictationAgentVision: {
+    cloudPurpose: "assistant",
     storeKeys: {
       mode: "dictationAgentVisionMode",
       provider: "dictationAgentVisionProvider",
@@ -53,10 +71,13 @@ export const INFERENCE_SCOPES = {
       cloudBaseUrl: "dictationAgentVisionCloudBaseUrl",
       customApiKey: "dictationAgentVisionCustomApiKey",
       disableThinking: "dictationAgentVisionDisableThinking",
+      reasoningEffort: "dictationAgentVisionReasoningEffort",
     },
     fallbackScope: "dictationAgent",
+    optional: true,
   },
   noteFormatting: {
+    cloudPurpose: "noteFormatting",
     storeKeys: {
       mode: "noteFormattingMode",
       provider: "noteFormattingProvider",
@@ -66,12 +87,15 @@ export const INFERENCE_SCOPES = {
       remoteUrl: "noteFormattingRemoteUrl",
       customApiKey: "noteFormattingCustomApiKey",
       disableThinking: "noteFormattingDisableThinking",
+      reasoningEffort: "noteFormattingReasoningEffort",
     },
     fallbackScope: "dictationCleanup",
   },
-  // Runs every chat conversation, including the voice assistant panel's
-  // standalone commands. Selection edits stay on dictationAgent(Vision).
+  // Runs typed chat conversations (Control Panel, note and container chat).
+  // The voice assistant panel's spoken commands, like selection edits, run on
+  // dictationAgent(Vision) — see resolveChatStreamingInference.
   chatIntelligence: {
+    cloudPurpose: "assistant",
     storeKeys: {
       mode: "chatAgentMode",
       provider: "chatAgentProvider",
@@ -81,9 +105,11 @@ export const INFERENCE_SCOPES = {
       remoteUrl: "chatAgentRemoteUrl",
       customApiKey: "chatAgentCustomApiKey",
       disableThinking: "chatAgentDisableThinking",
+      reasoningEffort: "chatAgentReasoningEffort",
     },
   },
   dictationTranslation: {
+    cloudPurpose: "translation",
     storeKeys: {
       mode: "translationMode",
       provider: "translationProvider",
@@ -93,8 +119,18 @@ export const INFERENCE_SCOPES = {
       remoteUrl: "translationRemoteUrl",
       customApiKey: "translationCustomApiKey",
       disableThinking: "translationDisableThinking",
+      reasoningEffort: "translationReasoningEffort",
     },
   },
 } as const satisfies Record<string, InferenceScopeDefinition>;
 
 export type InferenceScope = keyof typeof INFERENCE_SCOPES;
+
+/**
+ * Whether a scope in this mode runs its provider/model pair against a cloud
+ * catalog. Self-hosted, local and enterprise modes share the model key but can
+ * keep an old cloud provider, so catalog repairs must leave them alone.
+ */
+export function usesCloudModelCatalog(mode: unknown): boolean {
+  return mode === "providers" || mode === "openwhispr";
+}

@@ -1,7 +1,7 @@
 import { memo, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Check, Loader2, ShieldCheck, Sparkles, Users, X } from "lucide-react";
+import { Check, Loader2, Sparkles, Users, X } from "../icons";
 import { useStickToBottom } from "../../hooks/useStickToBottom";
 import { Popover, PopoverTrigger, PopoverContent } from "../ui/popover";
 import { Toggle } from "../ui/toggle";
@@ -9,7 +9,9 @@ import { cn } from "../lib/utils";
 import { MAX_SPEAKER_COUNT } from "../../constants/speakerDetection.json";
 import type { TranscriptSegment } from "../../stores/meetingRecordingStore";
 import {
+  isSelfSideSegment,
   isTranscriptSpeakerLocked,
+  isYouSpeakerName,
   resolveSegmentSpeakerName,
   type TranscriptSpeakerStatus,
 } from "../../utils/transcriptSpeakerState";
@@ -17,14 +19,14 @@ import {
 const BUBBLE_STYLES = {
   mic: {
     align: "justify-start",
-    radius: "rounded-bl-sm",
+    radius: "rounded-es-sm",
     bg: "bg-primary/60 text-primary-foreground/80",
     cursor: "bg-primary-foreground/60",
   },
   system: {
     align: "justify-end",
-    radius: "rounded-br-sm",
-    bg: "bg-surface-2/70 border border-border/20 text-foreground/80",
+    radius: "rounded-ee-sm",
+    bg: "bg-surface-2/70 border border-border/70 text-foreground/80",
     cursor: "bg-foreground/40",
   },
 } as const;
@@ -41,14 +43,14 @@ const SPEAKER_COLORS = [
 ];
 
 const SPEAKER_BORDER_COLORS = [
-  "border-l-blue-400/50",
-  "border-l-green-400/50",
-  "border-l-purple-400/50",
-  "border-l-orange-400/50",
-  "border-l-pink-400/50",
-  "border-l-cyan-400/50",
-  "border-l-yellow-400/50",
-  "border-l-red-400/50",
+  "border-s-blue-400/50",
+  "border-s-green-400/50",
+  "border-s-purple-400/50",
+  "border-s-orange-400/50",
+  "border-s-pink-400/50",
+  "border-s-cyan-400/50",
+  "border-s-yellow-400/50",
+  "border-s-red-400/50",
 ];
 
 // One unlabelled line of transcript; measureElement corrects each row on mount.
@@ -108,9 +110,11 @@ function PartialBubble({
       <div className="max-w-[80%] flex flex-col">
         {speakerLabel && (
           <div className="mb-0.5 flex items-center gap-1 px-1">
-            <span className="text-[11px] font-medium text-muted-foreground/70">{speakerLabel}</span>
+            <span dir="auto" className="text-[11px] font-medium text-muted-foreground/70">
+              {speakerLabel}
+            </span>
             {speakerState === "provisional" && (
-              <span className="inline-flex items-center gap-0.5 text-[10px] font-medium text-muted-foreground/40">
+              <span className="inline-flex items-center gap-0.5 text-[10px] font-medium text-muted-foreground/70">
                 <Sparkles size={9} />
                 {getSpeakerStateLabel("provisional", t)}
               </span>
@@ -125,9 +129,9 @@ function PartialBubble({
             "text-[13px] leading-relaxed italic"
           )}
         >
-          {text}
+          <span dir="auto">{text}</span>
           <span
-            className={cn("inline-block w-[2px] h-[13px] align-middle ml-0.5", s.cursor)}
+            className={cn("inline-block w-[2px] h-[13px] align-middle ms-0.5", s.cursor)}
             style={{ animation: "agent-cursor-blink 800ms steps(1) infinite" }}
           />
         </div>
@@ -150,6 +154,10 @@ interface SpeakerPickerProps {
   speakerProfiles?: SpeakerProfileLite[];
   participants?: Array<{ email: string; displayName: string | null }>;
   onSelectName: (name: string, email?: string | null, profileId?: number) => void;
+  // "offer": a voice that may be the user's gets a "This is me" row, which the
+  // user's own voice profile folds into. "exclude": a call's remote voice is
+  // never the user, so it can't be named after them.
+  self?: "offer" | "exclude";
   t: (key: string, opts?: Record<string, unknown>) => string;
 }
 
@@ -185,7 +193,7 @@ function AddContactButton({
         <button
           className={cn(
             "inline-flex items-center mb-0.5 px-1.5 py-0.5 rounded-md text-[11px] outline-none cursor-pointer",
-            "border border-dashed border-border/60 dark:border-white/15",
+            "border border-dashed border-border/70 dark:border-white/15",
             "text-foreground/50 hover:text-foreground hover:border-border/90 dark:hover:border-white/30",
             "transition-colors duration-150 focus-visible:ring-1 focus-visible:ring-ring"
           )}
@@ -194,10 +202,11 @@ function AddContactButton({
         </button>
       </PopoverTrigger>
       <PopoverContent className="w-64 p-3">
-        <div className="text-xs font-medium text-foreground truncate mb-2">
+        <div dir="auto" className="text-xs font-medium text-foreground truncate mb-2">
           {profile.display_name}
         </div>
         <input
+          dir="ltr"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
@@ -211,8 +220,8 @@ function AddContactButton({
           placeholder={t("notes.speaker.emailPlaceholder")}
           className={cn(
             "w-full px-2 py-1.5 rounded-md bg-transparent text-xs text-foreground",
-            "placeholder:text-foreground/25 outline-none",
-            "border border-border/50 focus:border-border/90 transition-colors"
+            "placeholder:text-foreground/45 outline-none",
+            "border border-border/70 focus:border-border/90 transition-colors"
           )}
           autoFocus
           type="email"
@@ -241,11 +250,39 @@ function AddContactButton({
   );
 }
 
-function SpeakerPicker({ speakerProfiles, participants, onSelectName, t }: SpeakerPickerProps) {
+function SpeakerPicker({
+  speakerProfiles,
+  participants,
+  onSelectName,
+  self,
+  t,
+}: SpeakerPickerProps) {
   const [search, setSearch] = useState("");
   const lower = search.toLowerCase();
   const trimmed = search.trim();
   const trimmedLower = trimmed.toLowerCase();
+
+  const youLabel = t("notes.speaker.you");
+  const youLower = youLabel.trim().toLowerCase();
+  const thisIsMe = t("notes.speaker.thisIsMe");
+  const selfProfiles = self
+    ? (speakerProfiles || []).filter((p) => isYouSpeakerName(p.display_name, youLabel))
+    : [];
+  // Naming the speaker after the existing profile adds this voice to it rather
+  // than to a second "You" profile.
+  const selfProfile = selfProfiles.find((p) => p.id != null) ?? selfProfiles[0];
+  const matchesSelf =
+    !!self &&
+    !!trimmed &&
+    (isYouSpeakerName(trimmed, youLabel) ||
+      selfProfiles.some((p) => p.email?.toLowerCase() === trimmedLower));
+  const showSelf =
+    self === "offer" &&
+    (!trimmed ||
+      matchesSelf ||
+      youLower.includes(trimmedLower) ||
+      thisIsMe.toLowerCase().includes(trimmedLower) ||
+      !!selfProfile?.email?.toLowerCase().includes(trimmedLower));
 
   const filteredParticipants = (participants || []).filter(
     (p) =>
@@ -255,12 +292,14 @@ function SpeakerPicker({ speakerProfiles, participants, onSelectName, t }: Speak
   );
   const filteredProfiles = (speakerProfiles || []).filter(
     (p) =>
-      !search ||
-      p.display_name.toLowerCase().includes(lower) ||
-      (p.email && p.email.toLowerCase().includes(lower))
+      !selfProfiles.includes(p) &&
+      (!search ||
+        p.display_name.toLowerCase().includes(lower) ||
+        (p.email && p.email.toLowerCase().includes(lower)))
   );
 
   const hasExactMatch =
+    matchesSelf ||
     filteredParticipants.some(
       (p) =>
         (p.displayName || "").toLowerCase() === trimmedLower ||
@@ -285,30 +324,55 @@ function SpeakerPicker({ speakerProfiles, participants, onSelectName, t }: Speak
     setSearch("");
   };
 
+  const selectSelf = () =>
+    onSelectName(
+      selfProfile?.display_name ?? youLabel,
+      selfProfile?.email ?? null,
+      selfProfile?.id
+    );
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && canCreate) {
+    if (e.key !== "Enter") return;
+    if (showSelf && matchesSelf) {
+      e.preventDefault();
+      selectSelf();
+    } else if (canCreate) {
       e.preventDefault();
       submitCreate();
     }
   };
 
-  const isEmpty = !filteredParticipants.length && !filteredProfiles.length && !canCreate;
+  const isEmpty =
+    !showSelf && !filteredParticipants.length && !filteredProfiles.length && !canCreate;
 
   return (
     <>
-      <div className="p-2 border-b border-border/50">
+      <div className="p-2 border-b border-border/70">
         <input
+          dir="auto"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={t("notes.speaker.nameOrEmailPlaceholder")}
-          className="w-full px-2 py-1.5 rounded-md bg-transparent text-xs text-foreground placeholder:text-foreground/20 outline-none border-none appearance-none"
+          className="w-full px-2 py-1.5 rounded-md bg-transparent text-xs text-foreground placeholder:text-foreground/45 outline-none border-none appearance-none"
           autoFocus
         />
       </div>
       <div className="max-h-52 overflow-y-auto">
+        {showSelf && (
+          <div className="p-1 border-b border-border/70">
+            <button
+              onClick={selectSelf}
+              className="flex items-center gap-2 w-full px-2 py-1.5 rounded-md text-xs text-foreground/70 hover:bg-foreground/5 transition-colors cursor-pointer"
+            >
+              <span dir="auto" className="truncate flex-1 text-start">
+                {thisIsMe}
+              </span>
+            </button>
+          </div>
+        )}
         {filteredParticipants.length > 0 && (
-          <div className="p-1 border-b border-border/30">
+          <div className="p-1 border-b border-border/70">
             <div className="px-2 py-1 text-[11px] font-medium text-muted-foreground">
               {t("notes.speaker.meetingAttendees")}
             </div>
@@ -318,16 +382,20 @@ function SpeakerPicker({ speakerProfiles, participants, onSelectName, t }: Speak
                 onClick={() => onSelectName(p.displayName || p.email.split("@")[0], p.email)}
                 className="flex items-center gap-2 w-full px-2 py-1.5 rounded-md text-xs text-foreground/70 hover:bg-foreground/5 transition-colors cursor-pointer"
               >
-                <span className="truncate flex-1 text-left">{p.displayName || p.email}</span>
+                <span dir="auto" className="truncate flex-1 text-start">
+                  {p.displayName || p.email}
+                </span>
                 {p.displayName && (
-                  <span className="text-foreground/30 truncate text-[11px]">{p.email}</span>
+                  <span dir="ltr" className="text-foreground/45 truncate text-[11px]">
+                    {p.email}
+                  </span>
                 )}
               </button>
             ))}
           </div>
         )}
         {filteredProfiles.length > 0 && (
-          <div className="p-1 border-b border-border/30">
+          <div className="p-1 border-b border-border/70">
             <div className="px-2 py-1 text-[11px] font-medium text-muted-foreground">
               {t("notes.speaker.knownSpeakers")}
             </div>
@@ -337,9 +405,13 @@ function SpeakerPicker({ speakerProfiles, participants, onSelectName, t }: Speak
                 onClick={() => onSelectName(p.display_name, p.email, p.id)}
                 className="flex items-center gap-2 w-full px-2 py-1.5 rounded-md text-xs text-foreground/70 hover:bg-foreground/5 transition-colors cursor-pointer"
               >
-                <span className="truncate flex-1 text-left">{p.display_name}</span>
+                <span dir="auto" className="truncate flex-1 text-start">
+                  {p.display_name}
+                </span>
                 {p.email && (
-                  <span className="text-foreground/30 truncate text-[11px]">{p.email}</span>
+                  <span dir="ltr" className="text-foreground/45 truncate text-[11px]">
+                    {p.email}
+                  </span>
                 )}
               </button>
             ))}
@@ -356,19 +428,23 @@ function SpeakerPicker({ speakerProfiles, participants, onSelectName, t }: Speak
               </span>
               {inputIsEmail ? (
                 <>
-                  <span className="text-foreground truncate">{nameFromEmail(trimmed)}</span>
-                  <span className="text-foreground/30 truncate text-[11px]">
+                  <span dir="auto" className="text-foreground truncate">
+                    {nameFromEmail(trimmed)}
+                  </span>
+                  <span dir="ltr" className="text-foreground/45 truncate text-[11px]">
                     {trimmed.toLowerCase()}
                   </span>
                 </>
               ) : (
-                <span className="text-foreground truncate">{trimmed}</span>
+                <span dir="auto" className="text-foreground truncate">
+                  {trimmed}
+                </span>
               )}
             </button>
           </div>
         )}
         {isEmpty && (
-          <div className="px-3 py-4 text-center text-[11px] text-foreground/30">
+          <div className="px-3 py-4 text-center text-[11px] text-foreground/45">
             {t("notes.speaker.nameOrEmailPlaceholder")}
           </div>
         )}
@@ -385,6 +461,7 @@ function SpeakerLabel({
   participants,
   colorIdx,
   isOriginallyYou,
+  self,
   onMap,
   onConfirm,
   onDismiss,
@@ -397,6 +474,7 @@ function SpeakerLabel({
   participants?: Array<{ email: string; displayName: string | null }>;
   colorIdx: number;
   isOriginallyYou: boolean;
+  self?: "offer" | "exclude";
   onMap?: (speakerId: string, name: string, email?: string | null, profileId?: number) => void;
   onConfirm?: (speakerId: string, name: string, profileId: number) => void;
   onDismiss?: (speakerId: string) => void;
@@ -420,7 +498,7 @@ function SpeakerLabel({
   if (hasSuggestion) {
     return (
       <span className="group inline-flex items-center gap-1 mb-0.5 px-1">
-        <span className="text-[11px] font-medium italic text-muted-foreground/60">
+        <span dir="auto" className="text-[11px] font-medium italic text-muted-foreground/70">
           {segment.suggestedName}
         </span>
         <button
@@ -455,7 +533,7 @@ function SpeakerLabel({
         <button
           className={cn(
             "inline-flex items-center text-[11px] font-medium mb-0.5 px-1.5 py-0.5 rounded-md outline-none cursor-pointer",
-            "border border-border/60 dark:border-white/20",
+            "border border-border/70 dark:border-white/20",
             "hover:bg-foreground/5 hover:border-border/90 dark:hover:border-white/30",
             "transition-colors duration-150 focus-visible:ring-1 focus-visible:ring-ring",
             SPEAKER_COLORS[colorIdx],
@@ -463,7 +541,7 @@ function SpeakerLabel({
             speakerState === "provisional" && "italic"
           )}
         >
-          {displayLabel}
+          <span dir="auto">{displayLabel}</span>
         </button>
       </PopoverTrigger>
       <PopoverContent className="w-72 p-0">
@@ -474,6 +552,7 @@ function SpeakerLabel({
             onMap?.(speakerId, name, email, profileId);
             setOpen(false);
           }}
+          self={self}
           t={t}
         />
       </PopoverContent>
@@ -501,7 +580,7 @@ function SelectCheckbox({
         "w-4 h-4 rounded-full border flex items-center justify-center transition-all cursor-pointer",
         isSelected
           ? "border-primary bg-primary text-primary-foreground opacity-100"
-          : "border-border/60 bg-background/80 opacity-0 group-hover:opacity-100 hover:border-foreground/50",
+          : "border-border/70 bg-background/80 opacity-0 group-hover:opacity-100 hover:border-foreground/50",
         className
       )}
     >
@@ -511,28 +590,33 @@ function SelectCheckbox({
 }
 
 export function SelectionBar({
-  count,
   onClear,
   speakerProfiles,
   participants,
   onAssignName,
+  selectedSegments,
+  speakerMappings,
   t,
 }: {
-  count: number;
   onClear: () => void;
   speakerProfiles?: SpeakerProfileLite[];
   participants?: Array<{ email: string; displayName: string | null }>;
   onAssignName: (name: string, email?: string | null, profileId?: number) => void;
+  selectedSegments: TranscriptSegment[];
+  speakerMappings?: Record<string, string>;
   t: (key: string, opts?: Record<string, unknown>) => string;
 }) {
   const [open, setOpen] = useState(false);
+  const offerSelf = selectedSegments.some(
+    (segment) => !isSelfSideSegment(segment, speakerMappings, t("notes.speaker.you"))
+  );
   return (
     <div
-      className="flex items-center gap-3 rounded-md border border-border/40 bg-surface-2/95 backdrop-blur px-3 py-1.5 text-xs shadow-lg"
+      className="flex items-center gap-3 rounded-md border border-border/70 bg-surface-2/95 backdrop-blur px-3 py-1.5 text-xs shadow-lg"
       style={{ animation: "agent-message-in 150ms ease-out both" }}
     >
       <span className="text-foreground/70 tabular-nums">
-        {t("notes.speaker.selected", { n: count })}
+        {t("notes.speaker.selected", { n: selectedSegments.length })}
       </span>
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
@@ -549,6 +633,7 @@ export function SelectionBar({
               onAssignName(name, email, profileId);
               setOpen(false);
             }}
+            self={offerSelf ? "offer" : undefined}
             t={t}
           />
         </PopoverContent>
@@ -615,12 +700,19 @@ const SegmentRow = memo(function SegmentRow({
   const hasSpeaker = !!segment.speaker;
   const isOriginallyYou = segment.speaker === "you";
   const isSystemSpeaker = hasSpeaker && !selfSide;
+  // Only an in-person mic cluster may be the user: diarization can't tell which
+  // voice is theirs. A call's remote voices never are, and its mic is already
+  // "you", where naming one line remaps every line of the mic.
+  const self =
+    segment.source === "system" ? "exclude" : !selfSide && !isOriginallyYou ? "offer" : undefined;
   const selectable = !!onToggleSelect;
 
+  // The user's own voice profile isn't a contact.
   const canAddContact =
     !!matchedProfile &&
     matchedProfile.id != null &&
     !matchedProfile.email &&
+    !isYouSpeakerName(matchedProfile.display_name, t("notes.speaker.you")) &&
     !!onAttachSpeakerEmail;
 
   const labelElement = hasSpeaker && (
@@ -633,6 +725,7 @@ const SegmentRow = memo(function SegmentRow({
         participants={participants}
         colorIdx={colorIdx}
         isOriginallyYou={isOriginallyYou}
+        self={self}
         onMap={onMapSpeaker}
         onConfirm={onConfirmSuggestion}
         onDismiss={onDismissSuggestion}
@@ -654,7 +747,7 @@ const SegmentRow = memo(function SegmentRow({
         "group flex flex-col",
         selfSide ? "items-start" : "items-end",
         !sameSpeaker && !isFirst && "mt-2",
-        selectable && (selfSide ? "pl-6" : "pr-6")
+        selectable && (selfSide ? "ps-6" : "pe-6")
       )}
       style={isNewest ? { animation: "agent-message-in 200ms ease-out both" } : undefined}
     >
@@ -677,23 +770,23 @@ const SegmentRow = memo(function SegmentRow({
             selfSide
               ? cn(
                   "bg-primary/90 text-primary-foreground",
-                  sameSpeaker ? "rounded-lg rounded-tl-sm" : "rounded-lg rounded-bl-sm"
+                  sameSpeaker ? "rounded-lg rounded-ss-sm" : "rounded-lg rounded-es-sm"
                 )
               : cn(
-                  "bg-surface-2 border border-border/30 text-foreground",
-                  sameSpeaker ? "rounded-lg rounded-tr-sm" : "rounded-lg rounded-br-sm",
-                  isSystemSpeaker && cn("border-l-2", SPEAKER_BORDER_COLORS[colorIdx])
+                  "bg-surface-2 border border-border/70 text-foreground",
+                  sameSpeaker ? "rounded-lg rounded-se-sm" : "rounded-lg rounded-ee-sm",
+                  isSystemSpeaker && cn("border-s-2", SPEAKER_BORDER_COLORS[colorIdx])
                 ),
             isSelected && "ring-2 ring-primary/60"
           )}
         >
-          {segment.text}
+          <span dir="auto">{segment.text}</span>
         </div>
         {selectable && (
           <SelectCheckbox
             isSelected={isSelected}
             onToggle={() => onToggleSelect?.(segment.id)}
-            className={cn("absolute top-1.5", selfSide ? "-left-6" : "-right-6")}
+            className={cn("absolute top-1.5", selfSide ? "-start-6" : "-end-6")}
           />
         )}
       </div>
@@ -728,6 +821,7 @@ interface MeetingTranscriptChatProps {
   onDismissSuggestion?: (speakerId: string) => void;
   onAttachSpeakerEmail?: (profileId: number, email: string | null) => void;
   onToggleSelect?: (segmentId: string) => void;
+  contentClassName?: string;
 }
 
 export function MeetingTranscriptChat({
@@ -752,6 +846,7 @@ export function MeetingTranscriptChat({
   onDismissSuggestion,
   onAttachSpeakerEmail,
   onToggleSelect,
+  contentClassName,
 }: MeetingTranscriptChatProps) {
   const { t } = useTranslation();
   const hasContent = segments.length > 0 || Boolean(micPartial) || Boolean(systemPartial);
@@ -794,13 +889,15 @@ export function MeetingTranscriptChat({
 
   // Per-segment derivations hoisted out of the row map: rows receive them as
   // stable props, so partial ticks (which change neither input) skip every row.
+  const youLabel = t("notes.speaker.you");
   const rowMeta = useMemo(
     () =>
       segments.map((segment) => ({
         key: getEffectiveSpeakerKey(segment, speakerMappings),
         activeName: resolveSegmentSpeakerName(segment, speakerMappings),
+        selfSide: isSelfSideSegment(segment, speakerMappings, youLabel),
       })),
-    [segments, speakerMappings]
+    [segments, speakerMappings, youLabel]
   );
 
   const colorByKey = useMemo(() => {
@@ -808,7 +905,8 @@ export function MeetingTranscriptChat({
     let nextIdx = 0;
     segments.forEach((segment, i) => {
       if (segment.source === "mic" && !segment.speaker) return;
-      if (segment.speaker === "you") return;
+      // Bubbles on the user's side aren't colored, so they take no slot.
+      if (rowMeta[i].selfSide) return;
       const key = rowMeta[i].key;
       if (!map.has(key)) {
         map.set(key, nextIdx % SPEAKER_COLORS.length);
@@ -829,33 +927,17 @@ export function MeetingTranscriptChat({
     return map;
   }, [speakerProfiles]);
 
-  const consentNotice = (
-    <div className="shrink-0 flex items-center justify-center gap-1 px-4 pt-2 pb-1 text-[10px] text-muted-foreground/50 select-none">
-      <ShieldCheck size={10} className="shrink-0" />
-      <span>{t("notes.speaker.consentNotice")}</span>
-    </div>
-  );
-
   if (!hasContent) {
     return (
       <div className="h-full flex flex-col">
-        {consentNotice}
         <div className="flex-1 flex items-center justify-center px-5">
-          <p className="text-xs text-muted-foreground/40 select-none">
+          <p className="text-xs text-muted-foreground/70 select-none">
             {t("notes.editor.conversationWillAppear")}
           </p>
         </div>
       </div>
     );
   }
-
-  const isSelfSide = (segment: TranscriptSegment): boolean => {
-    const mapped = segment.speaker ? speakerMappings?.[segment.speaker] : undefined;
-    if (mapped) return mapped.trim().toLowerCase() === t("notes.speaker.you").toLowerCase();
-    if (segment.speaker === "you") return true;
-    if (segment.speakerName) return false;
-    return segment.source === "mic";
-  };
 
   const showAssumedHint =
     !isDiarizing &&
@@ -866,80 +948,83 @@ export function MeetingTranscriptChat({
 
   return (
     <div className="h-full flex flex-col">
-      {consentNotice}
       {(isRecording || isDiarizing) && (
-        <div className="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1 mx-4 mb-1.5 px-3 py-1.5 rounded-lg border border-border/60 bg-surface-2/40 text-xs text-foreground">
-          <div className="flex items-center gap-1.5 min-w-0">
-            {isDiarizing ? (
-              <Loader2 size={12} className="animate-spin text-muted-foreground shrink-0" />
-            ) : (
-              <Sparkles
-                size={12}
-                className={cn(
-                  "shrink-0",
-                  sessionDiarizationEnabled ? "text-primary" : "text-muted-foreground"
-                )}
-              />
-            )}
-            <span className="truncate">
-              {isDiarizing
-                ? t("notes.speaker.pill.finalizing")
-                : sessionDiarizationEnabled
-                  ? t("notes.speaker.pill.identifying")
-                  : t("notes.speaker.pill.notLabeled")}
-            </span>
-            {showAssumedHint && (
-              <span className="text-muted-foreground truncate">
-                {t("notes.speaker.pill.assumedHint")}
+        <div className={cn("shrink-0 px-4 pt-2 mb-1.5", contentClassName)}>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-1.5 rounded-lg border border-border/70 bg-surface-2/40 text-xs text-foreground">
+            <div className="flex items-center gap-1.5 min-w-0">
+              {isDiarizing ? (
+                <Loader2 size={12} className="animate-spin text-muted-foreground shrink-0" />
+              ) : (
+                <Sparkles
+                  size={12}
+                  className={cn(
+                    "shrink-0",
+                    sessionDiarizationEnabled ? "text-primary" : "text-muted-foreground"
+                  )}
+                />
+              )}
+              <span className="truncate">
+                {isDiarizing
+                  ? t("notes.speaker.pill.finalizing")
+                  : sessionDiarizationEnabled
+                    ? t("notes.speaker.pill.identifying")
+                    : t("notes.speaker.pill.notLabeled")}
               </span>
+              {showAssumedHint && (
+                <span className="text-muted-foreground truncate">
+                  {t("notes.speaker.pill.assumedHint")}
+                </span>
+              )}
+            </div>
+            <div className="flex-1" />
+            {!isDiarizing && sessionDiarizationEnabled && (
+              <div className="flex items-center gap-1.5">
+                <span className="text-muted-foreground">
+                  {t("notes.speaker.pill.speakersLabel")}
+                </span>
+                <div className="flex items-center gap-0.5 rounded-md border border-border bg-surface-2/60">
+                  <button
+                    onClick={() => onSetSessionExpectedCount?.(sessionExpectedCount - 1)}
+                    disabled={sessionExpectedCount <= 1}
+                    className="px-1.5 py-0.5 rounded-s-md hover:bg-accent focus-visible:bg-accent focus-visible:outline-none disabled:opacity-30 disabled:pointer-events-none transition-colors"
+                    aria-label={t("notes.speaker.pill.decAria")}
+                  >
+                    −
+                  </button>
+                  <span className="px-1.5 tabular-nums" aria-live="polite">
+                    {sessionExpectedCount === 1
+                      ? t("notes.speaker.pill.justYou")
+                      : sessionExpectedCount}
+                  </span>
+                  <button
+                    onClick={() => onSetSessionExpectedCount?.(sessionExpectedCount + 1)}
+                    disabled={sessionExpectedCount >= MAX_SPEAKER_COUNT}
+                    className="px-1.5 py-0.5 rounded-e-md hover:bg-accent focus-visible:bg-accent focus-visible:outline-none disabled:opacity-30 disabled:pointer-events-none transition-colors"
+                    aria-label={t("notes.speaker.pill.incAria")}
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+            )}
+            {!isDiarizing && (
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => onSetSessionDiarizationEnabled?.(!sessionDiarizationEnabled)}
+                  className="text-muted-foreground hover:text-foreground transition-colors focus-visible:outline-none focus-visible:underline"
+                  aria-label={t("notes.speaker.pill.toggleAria")}
+                >
+                  {t("notes.speaker.pill.labelToggle")}
+                </button>
+                <div className="scale-75 -my-1">
+                  <Toggle
+                    checked={sessionDiarizationEnabled}
+                    onChange={(next) => onSetSessionDiarizationEnabled?.(next)}
+                  />
+                </div>
+              </div>
             )}
           </div>
-          <div className="flex-1" />
-          {!isDiarizing && sessionDiarizationEnabled && (
-            <div className="flex items-center gap-1.5">
-              <span className="text-muted-foreground">{t("notes.speaker.pill.speakersLabel")}</span>
-              <div className="flex items-center gap-0.5 rounded-md border border-border bg-surface-2/60">
-                <button
-                  onClick={() => onSetSessionExpectedCount?.(sessionExpectedCount - 1)}
-                  disabled={sessionExpectedCount <= 1}
-                  className="px-1.5 py-0.5 rounded-l-md hover:bg-accent focus-visible:bg-accent focus-visible:outline-none disabled:opacity-30 disabled:pointer-events-none transition-colors"
-                  aria-label={t("notes.speaker.pill.decAria")}
-                >
-                  −
-                </button>
-                <span className="px-1.5 tabular-nums" aria-live="polite">
-                  {sessionExpectedCount === 1
-                    ? t("notes.speaker.pill.justYou")
-                    : sessionExpectedCount}
-                </span>
-                <button
-                  onClick={() => onSetSessionExpectedCount?.(sessionExpectedCount + 1)}
-                  disabled={sessionExpectedCount >= MAX_SPEAKER_COUNT}
-                  className="px-1.5 py-0.5 rounded-r-md hover:bg-accent focus-visible:bg-accent focus-visible:outline-none disabled:opacity-30 disabled:pointer-events-none transition-colors"
-                  aria-label={t("notes.speaker.pill.incAria")}
-                >
-                  +
-                </button>
-              </div>
-            </div>
-          )}
-          {!isDiarizing && (
-            <div className="flex items-center gap-1.5">
-              <button
-                onClick={() => onSetSessionDiarizationEnabled?.(!sessionDiarizationEnabled)}
-                className="text-muted-foreground hover:text-foreground transition-colors focus-visible:outline-none focus-visible:underline"
-                aria-label={t("notes.speaker.pill.toggleAria")}
-              >
-                {t("notes.speaker.pill.labelToggle")}
-              </button>
-              <div className="scale-75 -my-1">
-                <Toggle
-                  checked={sessionDiarizationEnabled}
-                  onChange={(next) => onSetSessionDiarizationEnabled?.(next)}
-                />
-              </div>
-            </div>
-          )}
         </div>
       )}
       <div
@@ -949,16 +1034,15 @@ export function MeetingTranscriptChat({
         onTouchStart={handleTouchStart}
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
-        className="flex-1 min-h-0 overflow-y-auto px-4 pt-2 agent-chat-scroll pb-[var(--floating-inset,96px)]"
+        className="flex-1 min-h-0 overflow-y-auto pt-2 agent-chat-scroll pb-[var(--floating-inset,96px)]"
       >
-        <div>
+        <div className={cn("px-4", contentClassName)}>
           <div style={{ height: totalSize, width: "100%", position: "relative" }}>
             {virtualizer.getVirtualItems().map((virtualItem) => {
               const i = virtualItem.index;
               const segment = segments[i];
-              const selfSide = isSelfSide(segment);
+              const { key, activeName, selfSide } = rowMeta[i];
               const isSystemSpeaker = !!segment.speaker && !selfSide;
-              const { key, activeName } = rowMeta[i];
               return (
                 <div
                   key={segment.id}
@@ -976,7 +1060,9 @@ export function MeetingTranscriptChat({
                   <SegmentRow
                     segment={segment}
                     selfSide={selfSide}
-                    sameSpeaker={i > 0 && rowMeta[i - 1].key === key}
+                    sameSpeaker={
+                      i > 0 && rowMeta[i - 1].key === key && rowMeta[i - 1].selfSide === selfSide
+                    }
                     isFirst={i === 0}
                     isNewest={i === segments.length - 1}
                     colorIdx={isSystemSpeaker ? (colorByKey.get(key) ?? 0) : 0}

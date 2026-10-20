@@ -15,12 +15,24 @@ export interface ReasoningConfig {
   customApiKey?: string;
   provider?: string;
   disableThinking?: boolean;
+  reasoningEffort?: string;
   /** Screenshot attached to voice-agent requests when screen context is on. */
   screenContext?: ScreenContextImage;
   /** Suffix-free prompt used when a screenshot-carrying request is retried text-only. */
   textOnlySystemPrompt?: string;
   language?: string;
   requireCompleteOutput?: boolean;
+  /** Bundled local server only; callers must validate the decoded response. */
+  responseFormat?: { type: "json_object"; schema: Record<string, unknown> };
+  /**
+   * Local models only: when the prompt leaves less than `maxTokens` of room and
+   * the reply fills what is left, fail as CONTEXT_TOO_LARGE instead of
+   * returning a reply the context window clipped. With `requireCompleteOutput`,
+   * it still lets the allowance shrink to fit, where that flag alone refuses.
+   */
+  refuseClippedByWindow?: boolean;
+  /** Local models only: tags the request so `cancelLocalReasoning` can abort it. */
+  requestId?: string;
   requiresAgent?: boolean;
   inferenceScope?: InferenceScope;
 }

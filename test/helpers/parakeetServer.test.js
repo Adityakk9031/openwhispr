@@ -35,10 +35,11 @@ function wavFromSeconds(spans) {
   return buf;
 }
 
-function fakeWsServer(responses, { onCall } = {}) {
+function fakeWsServer(responses, { onCall, maxConcurrentDecodes = 1 } = {}) {
   const calls = [];
   return {
     calls,
+    maxConcurrentDecodes,
     async start() {},
     async transcribe(samplesBuffer) {
       calls.push(samplesBuffer.length);
@@ -131,6 +132,41 @@ test("a silent segment decoding to empty is not retried or flagged", async () =>
   assert.equal(fake.calls.length, 3);
 });
 
+test("long audio is cut in a pause before the limit, not mid-word at it", async () => {
+  const fake = fakeWsServer([{ text: "one" }, { text: "two" }]);
+  const manager = managerWith(fake);
+
+  const result = await manager.transcribe(
+    wavFromSeconds([{ seconds: 13 }, { seconds: 0.5, silent: true }, { seconds: 2.5 }])
+  );
+
+  assert.equal(result.text, "one two");
+  assert.deepEqual(fake.calls, [13.25 * SAMPLE_RATE * 4, 2.75 * SAMPLE_RATE * 4]);
+});
+
+test("a pause-aligned cut never adds a short extra segment", async () => {
+  const fake = fakeWsServer([{ text: "one" }, { text: "two" }]);
+  const manager = managerWith(fake);
+
+  const result = await manager.transcribe(
+    wavFromSeconds([{ seconds: 12 }, { seconds: 0.5, silent: true }, { seconds: 15.5 }])
+  );
+
+  assert.equal(result.text, "one two");
+  assert.deepEqual(fake.calls, [SEGMENT_BYTES, 13 * SAMPLE_RATE * 4]);
+});
+
+test("a remainder under half a second past the cap stays in the one request", async () => {
+  const fake = fakeWsServer([{ text: "" }, { text: "hello" }]);
+  const manager = managerWith(fake);
+
+  const result = await manager.transcribe(wavFromSeconds([{ seconds: 15.25 }]));
+
+  assert.equal(result.text, "hello");
+  assert.ok(!result.truncated, "nothing was split off to lose");
+  assert.deepEqual(fake.calls, [15.25 * SAMPLE_RATE * 4, 15.25 * SAMPLE_RATE * 4]);
+});
+
 test("a pre-aborted signal rejects before any decode is issued", async () => {
   const fake = fakeWsServer([]);
   const manager = managerWith(fake);
@@ -180,6 +216,49 @@ test("transcribe without a signal is unchanged", async () => {
 
   assert.equal(result.text, "one two three");
   assert.equal(fake.calls.length, 3);
+});
+
+test("segments decode side by side up to the server's limit and rejoin in order", async () => {
+  const pending = [];
+  const fake = {
+    maxConcurrentDecodes: 2,
+    async start() {},
+    transcribe: () => new Promise((resolve) => pending.push(resolve)),
+  };
+  const manager = managerWith(fake);
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+  const transcription = manager.transcribe(wavFromSeconds([{ seconds: 31 }]));
+  await flush();
+  assert.equal(pending.length, 2, "two segments in flight, the third waits for a slot");
+
+  pending[1]({ text: "two", elapsed: 1 });
+  pending[0]({ text: "one", elapsed: 1 });
+  await flush();
+  assert.equal(pending.length, 3);
+  pending[2]({ text: "three", elapsed: 1 });
+
+  const result = await transcription;
+  assert.equal(result.text, "one two three");
+  assert.equal(result.elapsed, 3);
+});
+
+test("a failing segment stops further segments from being scheduled", async () => {
+  const fake = fakeWsServer(
+    [{ text: "one" }, { text: "two" }, { text: "three" }, { text: "four" }, { text: "five" }],
+    { maxConcurrentDecodes: 2 }
+  );
+  const baseTranscribe = fake.transcribe;
+  fake.transcribe = async (samplesBuffer) => {
+    const isFirstCall = fake.calls.length === 0;
+    const result = await baseTranscribe(samplesBuffer);
+    if (isFirstCall) throw new Error("parakeet-ws transcription timed out");
+    return result;
+  };
+  const manager = managerWith(fake);
+
+  await assert.rejects(() => manager.transcribe(wavFromSeconds([{ seconds: 61 }])), /timed out/);
+  assert.equal(fake.calls.length, 2, "only the two already in flight ran");
 });
 
 test("cohere models segment at 30s and start the server with the resolved language", async () => {

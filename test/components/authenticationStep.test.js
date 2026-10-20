@@ -16,6 +16,7 @@ function createHarness() {
     refCursor: 0,
     values: {},
     refs: {},
+    socialSignIns: [],
     effects: [],
     cleanups: [],
     debouncedCalls: 0,
@@ -47,6 +48,8 @@ function textContent(node) {
   if (Array.isArray(node)) return node.map(textContent).join("");
   if (typeof node === "string") return node;
   if (!node || typeof node !== "object") return "";
+  // Hook-free presentational wrapper: expand it so its interpolated text is visible.
+  if (node.type?.name === "BidiInterpolatedText") return textContent(node.type(node.props));
   return textContent(node.props?.children);
 }
 
@@ -72,7 +75,7 @@ async function settleAsyncHandler() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
-test("email authentication discovers accounts, restores drafts, and persists them once per pause", async (t) => {
+async function createAuthenticationRenderer(t) {
   installBrowserGlobals(t, { window: { electronAPI: {} } });
   // The compact Back control is portalled to body (it has to out-stack the
   // onboarding shell's drag band), so rendering reads document.body.
@@ -86,7 +89,7 @@ test("email authentication discovers accounts, restores drafts, and persists the
 
   const vite = await createRendererServer(t, {
     cachePrefix: "openwhispr-authentication-step-",
-    noExternal: ["react", "react-dom", "react-i18next", "lucide-react"],
+    noExternal: ["react", "react-dom", "react-i18next"],
     mockModules: {
       // A minimal renderer rather than react-dom: it returns the element tree so
       // the assertions can read rendered output, and it collects effects so the
@@ -151,7 +154,10 @@ test("email authentication discovers accounts, restores drafts, and persists the
           },
           signIn: { async email() { return {}; } },
         };
-        export async function signInWithSocial() { return {}; }
+        export async function signInWithSocial(provider) {
+          globalThis.__authenticationStepHarness.socialSignIns.push(provider);
+          return {};
+        }
         export async function signInWithSSO(email) {
           const harness = globalThis.__authenticationStepHarness;
           harness.ssoCalls.push(email);
@@ -176,6 +182,8 @@ test("email authentication discovers accounts, restores drafts, and persists the
         return children;
       }`,
       "/utils/logger": `export default { error() {} };`,
+      // Off-macOS on purpose: a platform gate around a provider fails the
+      // Apple sign-in test instead of passing on the Node default.
       "/utils/platform": `export function getCachedPlatform() { return "linux"; }`,
       "/ForgotPasswordView": `export default function ForgotPasswordView() { return null; }`,
       "/OnboardingShell": `
@@ -183,7 +191,7 @@ test("email authentication discovers accounts, restores drafts, and persists the
       `,
       "/ui/button": `export function Button() { return null; }`,
       "/ui/input": `export function Input() { return null; }`,
-      "lucide-react": `
+      "/components/icons": `
         const Icon = () => null;
         export { Icon as AlertCircle, Icon as ArrowRight, Icon as Building2, Icon as Check,
           Icon as Loader2, Icon as ChevronLeft };
@@ -224,6 +232,12 @@ test("email authentication discovers accounts, restores drafts, and persists the
     return render(harness, overrides);
   };
 
+  return { render, typeEmail, submitEmail };
+}
+
+test("email authentication discovers accounts, restores drafts, and persists them once per pause", async (t) => {
+  const { render, typeEmail, submitEmail } = await createAuthenticationRenderer(t);
+
   const existingAccount = createHarness();
   existingAccount.discoveryResult = { exists: true };
   const signIn = await submitEmail(existingAccount, "returning@example.com");
@@ -239,6 +253,31 @@ test("email authentication discovers accounts, restores drafts, and persists the
   assert.deepEqual(existingAccount.discoveryCalls, [
     { email: "returning@example.com", authUrl: "https://auth.example.test" },
   ]);
+
+  // Regression test for #1700: the gate rejected any local part containing "+",
+  // so accounts the website had already created with a plus alias could not sign
+  // in from the app — on any surface, since this step backs all of them.
+  const plusAlias = createHarness();
+  plusAlias.discoveryResult = { exists: true };
+  const aliasSignIn = await submitEmail(plusAlias, "user+tag@example.com");
+  assert.deepEqual(
+    plusAlias.discoveryCalls,
+    [{ email: "user+tag@example.com", authUrl: "https://auth.example.test" }],
+    "a plus-addressed alias must reach discovery unchanged"
+  );
+  assert.equal(readOnlyEmailField(aliasSignIn)?.props.value, "user+tag@example.com");
+  assert.doesNotMatch(textContent(aliasSignIn), /auth\.errors\./);
+
+  // Replacing the plus gate kept a shape check, so input the server could only
+  // reject on a round trip still never leaves the welcome view.
+  const malformedEmail = createHarness();
+  const rejected = await submitEmail(malformedEmail, "not-an-email");
+  assert.deepEqual(
+    malformedEmail.discoveryCalls,
+    [],
+    "a malformed address must never reach discovery"
+  );
+  assert.match(textContent(rejected), /auth\.errors\.invalidEmail/);
 
   const newAccount = createHarness();
   const signUp = await submitEmail(newAccount, "new@example.com");
@@ -372,4 +411,22 @@ test("email authentication discovers accounts, restores drafts, and persists the
   assert.deepEqual(flushedWrites, [
     { authMode: null, email: "gone@example.com", fullName: "", ssoDiscovery: null },
   ]);
+});
+
+test("Apple sign-in is offered off macOS and shares the browser sign-in gate", async (t) => {
+  const { render } = await createAuthenticationRenderer(t);
+
+  const harness = createHarness();
+  const appleTile = providerTile(render(harness), "Apple");
+  assert.ok(appleTile, "Apple sign-in should render on Linux");
+  await appleTile.props.onClick();
+  assert.deepEqual(harness.socialSignIns, ["apple"]);
+
+  globalThis.window.electronAPI.getOAuthProtocolRegistered = async () => false;
+  const unregistered = createHarness();
+  render(unregistered);
+  await settleAsyncHandler();
+  const blockedTile = providerTile(render(unregistered), "Apple");
+  assert.equal(blockedTile.props.disabled, true);
+  assert.equal(blockedTile.props.title, "auth.social.protocolUnavailable");
 });

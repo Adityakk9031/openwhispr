@@ -20,6 +20,7 @@ const RENDERER_STREAMING_PROVIDERS = [
   "deepgram",
   "assemblyai",
   "openai-realtime",
+  "gemini",
   "corti",
   "tinfoil-realtime",
 ];
@@ -67,6 +68,64 @@ const RESOLUTION_MATRIX = [
     "openai-realtime",
   ],
   [
+    "gemini's live model routes to its own channels",
+    {
+      settings: settingsWith({
+        cloudTranscriptionProvider: "gemini",
+        cloudTranscriptionModel: "gemini-3.5-transcribe-live",
+      }),
+    },
+    "gemini",
+  ],
+  [
+    "gemini's batch model keeps the dictation default (HTTP, not streaming)",
+    {
+      settings: settingsWith({
+        cloudTranscriptionProvider: "gemini",
+        cloudTranscriptionModel: "gemini-3.5-transcribe",
+      }),
+    },
+    "openai-realtime",
+  ],
+  [
+    "deepgram byok streams over deepgram's own channels",
+    {
+      settings: settingsWith({
+        cloudTranscriptionProvider: "deepgram",
+        cloudTranscriptionModel: "nova-3",
+        cloudTranscriptionMode: "byok",
+      }),
+    },
+    "deepgram",
+  ],
+  [
+    "assemblyai byok streams over assemblyai's own channels",
+    {
+      settings: settingsWith({
+        cloudTranscriptionProvider: "assemblyai",
+        cloudTranscriptionModel: "universal-streaming-english",
+        cloudTranscriptionMode: "byok",
+      }),
+    },
+    "assemblyai",
+  ],
+  [
+    "a stale OpenAI realtime model cannot hijack a byok streaming-only provider",
+    {
+      settings: settingsWith({
+        cloudTranscriptionProvider: "deepgram",
+        cloudTranscriptionModel: "gpt-4o-mini-transcribe",
+        cloudTranscriptionMode: "byok",
+      }),
+    },
+    "deepgram",
+  ],
+  [
+    "deepgram on openwhispr cloud stays on the managed path",
+    { settings: settingsWith({ cloudTranscriptionProvider: "deepgram" }) },
+    "openai-realtime",
+  ],
+  [
     "batch model in notes context defaults to deepgram",
     { settings: settingsWith({ cloudTranscriptionModel: "whisper-1" }), context: "notes" },
     "deepgram",
@@ -110,6 +169,97 @@ test("resolution: every matrix outcome is a renderer channel binding", async () 
     );
   }
 });
+
+const GEMINI_LIVE = {
+  cloudTranscriptionProvider: "gemini",
+  cloudTranscriptionModel: "gemini-3.5-transcribe-live",
+};
+
+// [description, { settings, sttConfig }, resolved provider, counts toward Cloud usage]
+const METERING_MATRIX = [
+  ["managed openai-realtime", {}, "openai-realtime", true],
+  [
+    "openai-realtime on the user's key",
+    { settings: settingsWith({ cloudTranscriptionMode: "byok" }) },
+    "openai-realtime",
+    false,
+  ],
+  ["managed gemini live", { settings: settingsWith(GEMINI_LIVE) }, "gemini", true],
+  [
+    "gemini live on the user's key (#2558)",
+    { settings: settingsWith({ ...GEMINI_LIVE, cloudTranscriptionMode: "byok" }) },
+    "gemini",
+    false,
+  ],
+  [
+    "tinfoil left selected in Cloud mode still streams on the user's key",
+    { settings: settingsWith({ cloudTranscriptionProvider: "tinfoil" }) },
+    "tinfoil-realtime",
+    false,
+  ],
+  [
+    "corti on the user's credentials",
+    {
+      settings: settingsWith({
+        cloudTranscriptionProvider: "corti",
+        cloudTranscriptionMode: "byok",
+      }),
+    },
+    "corti",
+    false,
+  ],
+  [
+    "deepgram on the user's key",
+    {
+      settings: settingsWith({
+        cloudTranscriptionProvider: "deepgram",
+        cloudTranscriptionModel: "nova-3",
+        cloudTranscriptionMode: "byok",
+      }),
+    },
+    "deepgram",
+    false,
+  ],
+  [
+    "managed orukeet",
+    { sttConfig: { dictation: { mode: "streaming" }, streamingProvider: "orukeet" } },
+    "orukeet",
+    true,
+  ],
+  [
+    "self-hosted orukeet",
+    {
+      settings: settingsWith({
+        cloudTranscriptionMode: "byok",
+        cloudTranscriptionProvider: "custom",
+        cloudTranscriptionModel: "orukeet-v0.1.0",
+        cloudTranscriptionBaseUrl: "http://localhost:9000",
+      }),
+    },
+    "orukeet",
+    false,
+  ],
+];
+
+for (const [
+  name,
+  { settings = settingsWith({}), sttConfig = null },
+  provider,
+  metered,
+] of METERING_MATRIX) {
+  test(`metering: ${name}`, async () => {
+    const { resolveStreamingProviderName, buildStreamingSessionOptions, isCloudMeteredStream } =
+      await loadRouting();
+    const providerName = resolveStreamingProviderName({
+      settings,
+      context: "dictation",
+      sttConfig,
+    });
+    assert.equal(providerName, provider);
+    const options = buildStreamingSessionOptions({ providerName, settings, language: "auto" });
+    assert.equal(isCloudMeteredStream(options), metered);
+  });
+}
 
 test("options: openai-realtime sends provider explicitly and no preview (#1624)", async () => {
   const { buildStreamingSessionOptions } = await loadRouting();

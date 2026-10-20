@@ -9,7 +9,12 @@ const english = require("../../src/locales/en/translation.json");
 // /v1/models list already omits it. The default lookup must follow, otherwise
 // every reconciled selection lands on whatever Tinfoil happens to list first.
 const LIVE_CATALOG = [
-  { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", description: "", supportsThinking: true },
+  {
+    id: "deepseek-v4-1-flash",
+    name: "DeepSeek V4.1 Flash",
+    description: "",
+    supportsThinking: true,
+  },
   { id: "glm-5-3", name: "GLM-5.3", description: "", supportsThinking: true },
   { id: "gpt-oss-120b", name: "GPT-OSS 120B", description: "", supportsThinking: true },
 ];
@@ -26,7 +31,7 @@ test("tinfoil default model follows the glm-5-3 replacement", async (t) => {
   });
 
   await t.test("still falls back to the first served model when the default is gone", () => {
-    assert.equal(pickDefaultTinfoilModel(LIVE_CATALOG.slice(0, 1))?.id, "deepseek-v4-flash");
+    assert.equal(pickDefaultTinfoilModel(LIVE_CATALOG.slice(0, 1))?.id, "deepseek-v4-1-flash");
   });
 
   await t.test("registry names the default and no longer ships glm-5-2", () => {
@@ -51,7 +56,7 @@ test("tinfoil default model follows the glm-5-3 replacement", async (t) => {
 
 // Tinfoil's catalog is fetched live and cached, so its order is Tinfoil's, not
 // ours. Anything that resolves a default from list position lands on whatever
-// the enclave happens to serve first — deepseek-v4-flash today.
+// the enclave happens to serve first — deepseek-v4-1-flash today.
 test("a cached catalog does not displace the named Tinfoil default", async (t) => {
   installBrowserGlobals(t, {
     initialStorage: {
@@ -116,6 +121,27 @@ test("a persisted glm-5-2 selection is repointed before any request", async (t) 
   assert.equal(useSettingsStore.getState().cleanupModel, "glm-5-3");
 });
 
+// The sweep is one-shot per sentinel, and v1.10.x already wrote the first one.
+// A model retired after that release must be caught under a rotated key or the
+// upgraded install keeps 404ing.
+test("a deepseek-v4-flash selection is repointed where the first sweep already ran", async (t) => {
+  installBrowserGlobals(t, {
+    initialStorage: {
+      _llmScopeKeysMigrated: "1",
+      _retiredTinfoilModelsMigrated: "1",
+      cleanupMode: "providers",
+      cleanupProvider: "tinfoil",
+      cleanupModel: "deepseek-v4-flash",
+    },
+  });
+  const vite = await createRendererServer(t, {
+    cachePrefix: "openwhispr-tinfoil-rotated-sweep-test-",
+  });
+  const { useSettingsStore } = await vite.ssrLoadModule("/stores/settingsStore.ts");
+
+  assert.equal(useSettingsStore.getState().cleanupModel, "deepseek-v4-1-flash");
+});
+
 // The app tells a user when Tinfoil retires the model they picked. The startup
 // sweep now moves them before the live-catalog reconcile can, so the notice has
 // to come from the sweep or it is lost.
@@ -140,16 +166,18 @@ test("the retirement notice fires when the startup sweep is what moved the user"
     cachePrefix: "openwhispr-tinfoil-sweep-notice-test-",
   });
   const { useSettingsStore } = await vite.ssrLoadModule("/stores/settingsStore.ts");
-  const { consumeTinfoilModelSwitches } = await vite.ssrLoadModule(
-    "/stores/tinfoilModelSwitchStore.ts"
+  const { consumeRetiredModelSwitches } = await vite.ssrLoadModule(
+    "/stores/retiredModelSwitchStore.ts"
   );
 
   assert.equal(useSettingsStore.getState().cleanupModel, "glm-5-3");
   // Two scopes moved, but the user is told about the model once.
-  assert.deepEqual(consumeTinfoilModelSwitches(), [{ from: "GLM-5.2", to: "GLM-5.3" }]);
+  assert.deepEqual(consumeRetiredModelSwitches(), [
+    { provider: "tinfoil", from: "GLM-5.2", to: "GLM-5.3" },
+  ]);
 });
 
-test("a Groq remap is not announced as a Tinfoil retirement", async (t) => {
+test("a Groq remap is announced as Groq's retirement, not Tinfoil's", async (t) => {
   installBrowserGlobals(t, {
     initialStorage: {
       _llmScopeKeysMigrated: "1",
@@ -162,12 +190,14 @@ test("a Groq remap is not announced as a Tinfoil retirement", async (t) => {
     cachePrefix: "openwhispr-groq-sweep-notice-test-",
   });
   const { useSettingsStore } = await vite.ssrLoadModule("/stores/settingsStore.ts");
-  const { consumeTinfoilModelSwitches } = await vite.ssrLoadModule(
-    "/stores/tinfoilModelSwitchStore.ts"
+  const { consumeRetiredModelSwitches } = await vite.ssrLoadModule(
+    "/stores/retiredModelSwitchStore.ts"
   );
 
   assert.equal(useSettingsStore.getState().cleanupModel, "openai/gpt-oss-120b");
-  assert.deepEqual(consumeTinfoilModelSwitches(), []);
+  assert.deepEqual(consumeRetiredModelSwitches(), [
+    { provider: "groq", from: "llama-3.3-70b-versatile", to: "GPT-OSS 120B" },
+  ]);
 });
 
 // Every live site that resolves a provider's default reads the name the
@@ -219,10 +249,12 @@ test("a replacement with no curated name is still announced, by id", async (t) =
     cachePrefix: "openwhispr-tinfoil-unnamed-replacement-test-",
   });
   const { useSettingsStore } = await vite.ssrLoadModule("/stores/settingsStore.ts");
-  const { consumeTinfoilModelSwitches } = await vite.ssrLoadModule(
-    "/stores/tinfoilModelSwitchStore.ts"
+  const { consumeRetiredModelSwitches } = await vite.ssrLoadModule(
+    "/stores/retiredModelSwitchStore.ts"
   );
 
   assert.equal(useSettingsStore.getState().cleanupModel, "kimi-k3");
-  assert.deepEqual(consumeTinfoilModelSwitches(), [{ from: "Kimi K2.6", to: "kimi-k3" }]);
+  assert.deepEqual(consumeRetiredModelSwitches(), [
+    { provider: "tinfoil", from: "Kimi K2.6", to: "kimi-k3" },
+  ]);
 });

@@ -1,4 +1,11 @@
 const debugLogger = require("./debugLogger");
+const { randomUUID } = require("node:crypto");
+const {
+  meetingDestinationContext,
+  notificationCalendarEventId,
+  resolveMeetingDestination,
+  describeMeetingNote,
+} = require("./meetingNotificationDestination");
 const { openExternalUrl } = require("./externalUrlOpener");
 const { getMeetingJoinUrl } = require("./meetingJoinUrl");
 const createMeetingAutoEndController = require("./meetingAutoEndController");
@@ -7,16 +14,6 @@ const { broadcastToWindows } = require("./windowBroadcast");
 
 const IMMINENT_THRESHOLD_MS = 5 * 60 * 1000;
 const AUTO_END_TICK_MS = 1000;
-const AUTO_END_RESTART_WINDOW_MS = 30_000;
-// Clicking Restart is the user saying the meeting is still live. Honour that for
-// a while, or the same silence that just ended the recording ends it again a
-// minute later and they have to keep clicking.
-const AUTO_END_RESTART_GRACE_MS = 5 * 60_000;
-// The grace belongs to the recording the user restarted, which starts within a
-// second or two. Main cannot see a restart the renderer drops (its context died
-// with a reload, or a manual recording won the race), so an unclaimed grace has
-// to lapse rather than wait to be taken by whatever recording starts next.
-const AUTO_END_RESTART_CLAIM_MS = 30_000;
 
 const PLACEHOLDER_PREFIX = { __detected__: "detected", __manual__: "manual" };
 
@@ -58,14 +55,13 @@ class MeetingDetectionEngine {
     this.windowManager = windowManager;
     this.databaseManager = databaseManager;
     this.activeDetections = new Map();
-    this.preferences = { processDetection: true, audioDetection: true };
+    // Saved renderer preferences arrive after engine startup.
+    this.preferences = { processDetection: false, audioDetection: false };
     this._userRecording = false;
     this._meetingModeActive = false;
     this._notificationQueue = [];
     this._postRecordingCooldown = null;
     this._recordingSession = null;
-    this._pendingAutoEnd = null;
-    this._autoEndRestartGrace = null;
     this._now = now;
     this._setInterval = setInterval;
     this._clearInterval = clearInterval;
@@ -150,149 +146,15 @@ class MeetingDetectionEngine {
     );
     const ownerWebContents = session.ownerWebContents;
     if (!ownerWebContents || ownerWebContents.isDestroyed?.()) return;
-    this._clearAutoEndRecovery();
-    this._pendingAutoEnd = {
-      sessionId,
-      reason,
-      ownerWebContents,
-      expiresAt: null,
-    };
     try {
       ownerWebContents.send("meeting-auto-end-requested", { sessionId, reason });
     } catch (error) {
-      this._pendingAutoEnd = null;
       debugLogger.error(
         "Failed to request meeting auto-end from recording renderer",
         { error: error?.message, sessionId },
         "meeting"
       );
     }
-  }
-
-  // Time-bounded on purpose: the window manager destroys a notification window
-  // on paths that cannot notify us (_hideNormalAppSurfaces, a late detection
-  // response landing on a replaced card), and this gate holds every meeting
-  // prompt. Without the deadline one of those silently kills detection for the
-  // rest of the app session.
-  _hasLiveAutoEndOffer() {
-    const expiresAt = this._pendingAutoEnd?.expiresAt;
-    return expiresAt != null && this._now() < expiresAt;
-  }
-
-  _clearAutoEndRecovery({ dismiss = true } = {}) {
-    const pending = this._pendingAutoEnd;
-    this._pendingAutoEnd = null;
-    if (dismiss && pending?.expiresAt != null) {
-      this.windowManager.dismissMeetingAutoEndNotification?.(pending.sessionId);
-    }
-  }
-
-  async completeAutoEndSession(sessionId, ownerWebContents) {
-    const pending = this._pendingAutoEnd;
-    if (
-      !pending ||
-      pending.sessionId !== sessionId ||
-      pending.ownerWebContents !== ownerWebContents ||
-      pending.expiresAt !== null ||
-      this._recordingSession !== null ||
-      ownerWebContents?.isDestroyed?.()
-    ) {
-      return false;
-    }
-
-    const expiresAt = this._now() + AUTO_END_RESTART_WINDOW_MS;
-    pending.expiresAt = expiresAt;
-    try {
-      const shown = await this.windowManager.showMeetingAutoEndNotification?.({
-        sessionId,
-        reason: pending.reason,
-        expiresAt,
-      });
-      if (this._pendingAutoEnd !== pending) return false;
-      // Only an explicit success offers the restart: anything else (a missing
-      // window manager method, a load aborted by a replacement) means the card
-      // the user would click never appeared.
-      if (shown !== true) {
-        this._clearAutoEndRecovery({ dismiss: false });
-        return false;
-      }
-      debugLogger.info(
-        "Meeting recording auto-ended; restart window shown",
-        { sessionId, reason: pending.reason, expiresAt },
-        "meeting"
-      );
-      return true;
-    } catch (error) {
-      if (this._pendingAutoEnd === pending) {
-        this._clearAutoEndRecovery({ dismiss: false });
-      }
-      debugLogger.error(
-        "Failed to show meeting auto-end recovery notification",
-        { error: error?.message, sessionId },
-        "meeting"
-      );
-      return false;
-    }
-  }
-
-  respondToAutoEndNotification(sessionId, action, responderWebContents) {
-    if (
-      (action !== "restart" && action !== "dismiss") ||
-      !this.windowManager.isMeetingNotificationSender?.(responderWebContents)
-    ) {
-      return false;
-    }
-
-    const pending = this._pendingAutoEnd;
-    if (!pending || pending.sessionId !== sessionId || pending.expiresAt === null) return false;
-    if (this._now() >= pending.expiresAt || this._recordingSession !== null) {
-      this._clearAutoEndRecovery();
-      this._flushNotificationQueue();
-      return false;
-    }
-
-    const ownerWebContents = pending.ownerWebContents;
-    this._clearAutoEndRecovery();
-    if (action === "dismiss") {
-      this._flushNotificationQueue();
-      return true;
-    }
-
-    // A delivered restart deliberately does not flush: the user chose the old
-    // meeting, and the recording about to start gates the queue again anyway.
-    // One that cannot be delivered starts nothing, so the detections held
-    // behind the offer have to go out.
-    if (!ownerWebContents || ownerWebContents.isDestroyed?.()) {
-      this._flushNotificationQueue();
-      return false;
-    }
-
-    try {
-      ownerWebContents.send("meeting-auto-end-restart-requested", { sessionId });
-      const nowMs = this._now();
-      this._autoEndRestartGrace = {
-        suppressUntil: nowMs + AUTO_END_RESTART_GRACE_MS,
-        claimUntil: nowMs + AUTO_END_RESTART_CLAIM_MS,
-      };
-      return true;
-    } catch (error) {
-      debugLogger.error(
-        "Failed to request meeting recording restart",
-        { error: error?.message, sessionId },
-        "meeting"
-      );
-      this._flushNotificationQueue();
-      return false;
-    }
-  }
-
-  // `flushQueued` is false when a replacement notification is already being
-  // shown: flushing there would re-enter showMeetingNotification.
-  handleAutoEndNotificationClosed(sessionId, { flushQueued = true } = {}) {
-    if (this._pendingAutoEnd?.sessionId !== sessionId) return false;
-    this._clearAutoEndRecovery({ dismiss: false });
-    if (flushQueued) this._flushNotificationQueue();
-    return true;
   }
 
   // Hot path — called for every meeting PCM chunk of both channels.
@@ -365,15 +227,11 @@ class MeetingDetectionEngine {
       "meeting"
     );
     this._audioActivityMonitor.reset();
-    const grace = this._autoEndRestartGrace;
-    this._autoEndRestartGrace = null;
-    const suppressUntil = grace && this._now() < grace.claimUntil ? grace.suppressUntil : 0;
     this._autoEndController.beginSession({
       sessionId,
       eligible: true,
       reliable: externalMicState.reliable,
       externalMicActive: externalMicState.externalMicActive,
-      suppressUntil,
       ...this._audioActivityMonitor.getState(),
     });
     this._autoEndActive = true;
@@ -385,8 +243,8 @@ class MeetingDetectionEngine {
     autoEndEligible,
     ownerWebContents,
     systemAudioAvailable = false,
+    noteId = null,
   }) {
-    this._clearAutoEndRecovery();
     if (this._recordingSession) this._deactivateAutoEnd();
 
     this._recordingSession = {
@@ -394,6 +252,9 @@ class MeetingDetectionEngine {
       autoEndEligible: autoEndEligible === true,
       ownerWebContents,
       systemAudioAvailable: systemAudioAvailable === true,
+      // Lets a second manual start surface this recording instead of opening a
+      // new note over it.
+      noteId,
     };
     this._syncMeetingProcessDetector();
 
@@ -503,12 +364,7 @@ class MeetingDetectionEngine {
     // clears it while the recording is still live; the tracked session is the
     // gate that cannot be reset from outside. A prompt shown then could replace
     // the recording UI while the tracked recording is still active.
-    if (
-      this._userRecording ||
-      this._postRecordingCooldown ||
-      this._recordingSession ||
-      this._hasLiveAutoEndOffer()
-    ) {
+    if (this._userRecording || this._postRecordingCooldown || this._recordingSession) {
       debugLogger.info("Detection queued — user is recording", { detectionId, source }, "meeting");
       this._notificationQueue.push({ source, key, data });
       this.activeDetections.set(detectionId, { source, key, data });
@@ -571,7 +427,6 @@ class MeetingDetectionEngine {
     }
 
     this.windowManager.showMeetingNotification({
-      kind: "detection",
       detectionId,
       source,
       key,
@@ -581,103 +436,119 @@ class MeetingDetectionEngine {
     });
   }
 
-  async handleNotificationResponse(detectionId, action) {
-    debugLogger.info("Notification response", { detectionId, action }, "meeting");
-    try {
-      const detection = this.activeDetections.get(detectionId);
-
-      if ((action === "start" || action === "join") && detection) {
-        if (action === "join") {
-          const joinUrl = getMeetingJoinUrl(detection.event);
-          if (joinUrl) {
-            openExternalUrl(joinUrl).catch((error) =>
-              debugLogger.error(
-                "Failed to open meeting link",
-                { error: error.message, joinUrl },
-                "meeting"
-              )
-            );
-          }
-        }
-
-        const eventSummary = detection.event?.summary || "New note";
-
-        const isRealEvent =
-          detection.event?.calendar_id &&
-          detection.event.calendar_id !== "__detected__" &&
-          detection.event.calendar_id !== "__manual__";
-
-        if (
-          isRealEvent &&
-          (await this._resumeExistingEventNote(detection.event, "calendar-join"))
-        ) {
-          this._meetingModeActive = true;
-          this.audioActivityDetector.resetPrompt();
-          return;
-        }
-
-        const noteResult = this.databaseManager.saveNote(eventSummary, "", "meeting");
-        const meetingsFolder = this.databaseManager.getMeetingsFolder();
-
-        if (!noteResult?.note?.id || !meetingsFolder?.id) {
-          debugLogger.error(
-            "Meeting note creation failed",
-            { noteId: noteResult?.note?.id, folderId: meetingsFolder?.id },
-            "meeting"
-          );
-          return;
-        }
-
-        this._meetingModeActive = true;
-
-        broadcastToWindows("note-added", noteResult.note);
-
-        if (isRealEvent) {
-          const calEvent = this.databaseManager.getCalendarEventById(detection.event.id);
-          const updates = { calendar_event_id: detection.event.id };
-          if (calEvent?.attendees) {
-            updates.participants = calEvent.attendees;
-          }
-          const updateResult = this.databaseManager.updateNote(noteResult.note.id, updates);
-          if (updateResult?.success && updateResult?.note) {
-            broadcastToWindows("note-updated", updateResult.note);
-          }
-        }
-
-        await this.windowManager.queueMeetingNoteNavigation({
-          noteId: noteResult.note.id,
-          folderId: meetingsFolder.id,
-          event: detection.event,
-          trigger: "calendar-join",
-        });
-
-        this.audioActivityDetector.resetPrompt();
-      } else if (action === "dismiss") {
-        if (detection) {
-          this._dismiss();
-        }
-      }
-    } catch (error) {
-      this._meetingModeActive = false;
-      debugLogger.error(
-        "Error handling notification response",
-        { error: error?.message, detectionId, action },
-        "meeting"
-      );
-    } finally {
-      // One overlay at a time — a response settles every pending detection,
-      // including any the responded prompt replaced.
-      this.activeDetections.clear();
-      this.windowManager.dismissMeetingNotification();
+  handleNotificationResponse(detectionId, action, options = {}, owner) {
+    if (!["start", "join", "dismiss"].includes(action))
+      return Promise.resolve({ success: false, code: "INVALID_REQUEST" });
+    if (owner.responsePromise) return owner.responsePromise;
+    if (action === "dismiss") {
+      this._dismiss();
+      this.activeDetections.delete(detectionId);
+      this.windowManager.dismissMeetingNotification({ notifyEngine: false });
+      return Promise.resolve({ success: true, value: null });
     }
+    owner.responseInFlight = true;
+    this.windowManager.updateMeetingNotificationPause(owner);
+    owner.responsePromise = Promise.resolve()
+      .then(() => this._startNotification(owner, action, options))
+      .catch((error) => {
+        debugLogger.error("Meeting notification start failed", { error: error.message }, "meeting");
+        return {
+          success: false,
+          code: error.code === "NOTE_UNAVAILABLE" ? error.code : "START_FAILED",
+        };
+      })
+      .finally(() => {
+        owner.responseInFlight = false;
+        owner.responsePromise = null;
+        this.windowManager.updateMeetingNotificationPause(owner);
+      });
+    return owner.responsePromise;
   }
 
-  async startManualMeeting() {
+  async _startNotification(owner, action, options) {
+    if (action === "join" && !owner.joinDispatched) {
+      owner.joinDispatched = true;
+      const joinUrl = getMeetingJoinUrl(owner.detection.event);
+      if (joinUrl)
+        void openExternalUrl(joinUrl).catch((error) =>
+          debugLogger.error("Failed to open meeting link", { error: error.message }, "meeting")
+        );
+    }
+    const db = this.databaseManager;
+    const context = () =>
+      meetingDestinationContext(db, owner, this.windowManager.meetingRecentDestinations);
+    const eventId = notificationCalendarEventId(owner);
+    let note = owner.committedNoteId
+      ? db.getNote(owner.committedNoteId)
+      : eventId
+        ? db.getOwnNoteByCalendarEventId(eventId, { throwOnError: true })
+        : null;
+    const matches = (ref, row) =>
+      ref &&
+      ref.noteId === row.id &&
+      ref.spaceId === row.space_id &&
+      ref.folderId === row.folder_id;
+    if (note) {
+      if (!describeMeetingNote(db, note)) return { success: false, code: "NOTE_UNAVAILABLE" };
+      if (!matches(options.existingNote, note) && !matches(owner.authorizedNote, note)) {
+        return { success: false, code: "LINKED_NOTE_CHANGED", context: context() };
+      }
+    } else {
+      if (owner.committedNoteId || options.existingNote || owner.authorizedNote)
+        return { success: false, code: "NOTE_UNAVAILABLE" };
+      const available = context();
+      const ref = owner.selectedDestination ?? available.defaultDestination;
+      const folder = resolveMeetingDestination(db, ref);
+      if (!folder) return { success: false, code: "FOLDER_UNAVAILABLE" };
+      const calendarEvent = eventId ? db.getCalendarEventById(eventId) : null;
+      const result = db.createMeetingNoteForNotification({
+        title: owner.detection.event?.summary || "New note",
+        folderId: folder.id,
+        spaceId: folder.space_id,
+        eventId,
+        participants: calendarEvent?.attendees,
+      });
+      note = result.note;
+      owner.committedNoteId = note.id;
+      if (!result.created)
+        return { success: false, code: "LINKED_NOTE_CHANGED", context: context() };
+      broadcastToWindows("note-added", note);
+    }
+    owner.authorizedNote = { noteId: note.id, spaceId: note.space_id, folderId: note.folder_id };
+    // Entered before navigation so a detection arriving meanwhile cannot
+    // replace this prompt and cancel the Start after its note is saved.
+    this._meetingModeActive = true;
+    // Join leaves the meeting it just opened in front: an open panel updates
+    // behind it instead of covering the call.
+    const navigation = await this.windowManager.queueMeetingNoteNavigation(
+      { ...owner.authorizedNote, navigationId: randomUUID() },
+      { owner, activate: action !== "join" }
+    );
+    if (!navigation.success) {
+      this._meetingModeActive = false;
+      return navigation;
+    }
+    this.audioActivityDetector.resetPrompt();
+    this.activeDetections.delete(owner.prompt.detectionId);
+    this.windowManager.dismissMeetingNotification({ notifyEngine: false });
+    return { success: true, value: null };
+  }
+
+  async startManualMeeting(options) {
     debugLogger.info("Starting manual meeting", {}, "meeting");
+
+    // A live meeting already owns a note: a second start would leave the recording
+    // running in it behind a new, empty one. Surface the live note instead.
+    if (this._recordingSession) {
+      const { noteId } = this._recordingSession;
+      debugLogger.info("Manual meeting ignored — a recording is live", { noteId }, "meeting");
+      if (noteId != null) await this.windowManager.queueNoteNavigation({ noteId }, options);
+      return;
+    }
 
     const activeEvents = this.databaseManager.getActiveEvents();
     if (activeEvents?.length > 0) {
-      return this.joinCalendarMeeting(activeEvents[0].id, "hotkey");
+      return this.joinCalendarMeeting(activeEvents[0].id, "hotkey", options);
     }
 
     this._meetingModeActive = true;
@@ -699,33 +570,39 @@ class MeetingDetectionEngine {
 
     broadcastToWindows("note-added", noteResult.note);
 
-    await this.windowManager.queueMeetingNoteNavigation({
-      noteId: noteResult.note.id,
-      folderId: meetingsFolder.id,
-      event,
-      trigger: "hotkey",
-    });
+    await this.windowManager.queueMeetingNoteNavigation(
+      {
+        noteId: noteResult.note.id,
+        folderId: meetingsFolder.id,
+        event,
+        trigger: "hotkey",
+      },
+      options
+    );
   }
 
-  /** Navigates to the note already linked to a calendar event, if any. */
-  async _resumeExistingEventNote(event, trigger) {
-    const existingNote = this.databaseManager.getNoteByCalendarEventId(event.id);
+  /** Navigates to the user's own note already linked to a calendar event, if any. */
+  async _resumeExistingEventNote(event, trigger, options) {
+    const existingNote = this.databaseManager.getOwnNoteByCalendarEventId(event.id);
     if (!existingNote?.id) return false;
     debugLogger.info(
       "Reusing existing note for calendar meeting",
       { eventId: event.id, noteId: existingNote.id, trigger },
       "meeting"
     );
-    await this.windowManager.queueMeetingNoteNavigation({
-      noteId: existingNote.id,
-      folderId: existingNote.folder_id ?? this.databaseManager.getMeetingsFolder()?.id,
-      event,
-      trigger,
-    });
+    await this.windowManager.queueMeetingNoteNavigation(
+      {
+        noteId: existingNote.id,
+        folderId: existingNote.folder_id ?? this.databaseManager.getMeetingsFolder()?.id,
+        event,
+        trigger,
+      },
+      options
+    );
     return true;
   }
 
-  async joinCalendarMeeting(eventId, trigger = "calendar-join") {
+  async joinCalendarMeeting(eventId, trigger = "calendar-join", options) {
     this._meetingModeActive = true;
     debugLogger.info("Joining calendar meeting", { eventId, trigger }, "meeting");
 
@@ -737,7 +614,7 @@ class MeetingDetectionEngine {
     }
 
     // Joining the same event twice resumes its note instead of creating a duplicate.
-    if (await this._resumeExistingEventNote(calEvent, trigger)) {
+    if (await this._resumeExistingEventNote(calEvent, trigger, options)) {
       return;
     }
 
@@ -762,18 +639,21 @@ class MeetingDetectionEngine {
 
     broadcastToWindows("note-added", updateResult?.note || noteResult.note);
 
-    await this.windowManager.queueMeetingNoteNavigation({
-      noteId: noteResult.note.id,
-      folderId: meetingsFolder.id,
-      event: calEvent,
-      trigger,
-    });
+    await this.windowManager.queueMeetingNoteNavigation(
+      {
+        noteId: noteResult.note.id,
+        folderId: meetingsFolder.id,
+        event: calEvent,
+        trigger,
+      },
+      options
+    );
   }
 
   // A card can vanish without a response — a compositor kill, a load failure,
-  // onboarding taking the screen. Only this detection is released, unlike a
-  // response or an expiry which settle every pending one: clearing them all
-  // would strand _notificationQueue, whose entries the flush below looks up in
+  // onboarding taking the screen. Only this detection is released, unlike an
+  // expiry, which settles every pending one: clearing them all would strand
+  // _notificationQueue, whose entries the flush below looks up in
   // activeDetections.
   handleDetectionNotificationClosed(detectionId, { flushQueued = true } = {}) {
     if (!this.activeDetections.has(detectionId)) return;
@@ -786,12 +666,7 @@ class MeetingDetectionEngine {
     if (flushQueued) this._flushNotificationQueue();
   }
 
-  handleNotificationTimeout(notification = null) {
-    if (notification?.kind === "auto-end") {
-      this.handleAutoEndNotificationClosed(notification.sessionId);
-      return;
-    }
-
+  handleNotificationTimeout() {
     // Expiring unanswered is not a decline, so no dismissal cooldown starts:
     // the detector's hasPrompted flag already keeps the ongoing call from
     // re-prompting, while a call starting right after the timeout still
@@ -820,29 +695,23 @@ class MeetingDetectionEngine {
       return;
     }
 
-    // The post-recording cooldown fires 2.5s after an auto-end stop, while the
-    // restart card still has most of its window left. Showing a prompt here
-    // would replace that card and silently void the restart offer.
-    if (this._hasLiveAutoEndOffer()) {
-      debugLogger.info("Holding queued notifications — restart offer live", {}, "meeting");
-      return;
-    }
-
     debugLogger.info(
       "Flushing notification queue",
       { count: this._notificationQueue.length },
       "meeting"
     );
 
-    const best = this._notificationQueue[0];
-    const detectionId = `${best.source}:${best.key}`;
-
-    const detection = this.activeDetections.get(detectionId);
-    if (detection) {
-      this._showPrompt(detectionId, best.source, best.key, best.data);
-    }
-
+    const [best, ...discarded] = this._notificationQueue;
     this._notificationQueue = [];
+    // This flush coalesces the batch into one prompt. Entries it discards must
+    // not keep suppressing future microphone detections after that prompt ends.
+    for (const { source, key, data } of discarded) {
+      const id = `${source}:${key}`;
+      if (this.activeDetections.get(id)?.data === data) this.activeDetections.delete(id);
+    }
+    const detectionId = `${best.source}:${best.key}`;
+    const detection = this.activeDetections.get(detectionId);
+    if (detection) this._showPrompt(detectionId, best.source, best.key, best.data);
   }
 
   _dismiss() {
@@ -895,10 +764,6 @@ class MeetingDetectionEngine {
     this._syncAudioActivityDetector();
   }
 
-  getPreferences() {
-    return { ...this.preferences };
-  }
-
   start() {
     debugLogger.info("Meeting detection engine started", this.preferences, "meeting");
     this._syncMeetingProcessDetector();
@@ -907,8 +772,6 @@ class MeetingDetectionEngine {
 
   stop() {
     debugLogger.info("Meeting detection engine stopped", {}, "meeting");
-    this._clearAutoEndRecovery();
-    this._autoEndRestartGrace = null;
     this._deactivateAutoEnd();
     this._recordingSession = null;
     this.meetingProcessDetector.stop();
@@ -924,6 +787,3 @@ class MeetingDetectionEngine {
 }
 
 module.exports = MeetingDetectionEngine;
-module.exports.AUTO_END_RESTART_WINDOW_MS = AUTO_END_RESTART_WINDOW_MS;
-module.exports.AUTO_END_RESTART_GRACE_MS = AUTO_END_RESTART_GRACE_MS;
-module.exports.AUTO_END_RESTART_CLAIM_MS = AUTO_END_RESTART_CLAIM_MS;

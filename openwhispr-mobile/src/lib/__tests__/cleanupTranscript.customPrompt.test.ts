@@ -1,0 +1,132 @@
+/**
+ * Custom cleanup prompt wiring in cleanupTranscript:
+ * - the stored override is passed as `customPrompt` for every cleanup context,
+ *   including a dictation that addresses the assistant by name
+ * - existing short-circuits (cleanup off) stay ahead of it
+ */
+import { ReasoningService } from '@/services/reasoning/ReasoningService';
+import { cleanupTranscript, CLEANUP_TIMEOUT_MS } from '@/lib/cleanupTranscript';
+
+// accountAccess pulls in the router for its sign-in alert; stub it here.
+jest.mock('expo-router', () => ({ router: { push: jest.fn() } }));
+jest.mock('@/services/reasoning/ReasoningService', () => ({
+  ReasoningService: {
+    processText: jest.fn(async (req: { text: string }) => ({
+      text: `cleaned:${req.text}`,
+      model: 'm',
+    })),
+  },
+}));
+jest.mock('@/store/useAuthStore', () => ({
+  useAuthStore: { getState: () => ({ user: { id: 'u', isAnonymous: false } }) },
+}));
+jest.mock('@/store/useSnippetsStore', () => ({
+  useSnippetsStore: { getState: () => ({ isLoaded: true, entries: [] }) },
+}));
+jest.mock('@/store/useDictionaryStore', () => ({
+  useDictionaryStore: { getState: () => ({ isLoaded: true, entries: [] }) },
+}));
+
+let mockConfig: Record<string, unknown> = { cleanupEnabled: true, defaultMode: 'cloud' };
+let mockActiveMode = 'cloud';
+let mockCustomPrompt: string | undefined = 'Always use bullet points, {{agentName}}.';
+
+jest.mock('@/store/useConfigStore', () => ({
+  useConfigStore: { getState: () => ({ config: mockConfig }) },
+}));
+jest.mock('@/store/useProcessingModeStore', () => ({
+  useProcessingModeStore: { getState: () => ({ activeMode: mockActiveMode }) },
+}));
+jest.mock('@/store/useCustomPromptsStore', () => ({
+  getActiveCustomCleanupPrompt: () => mockCustomPrompt,
+}));
+
+const mockProcessText = ReasoningService.processText as jest.Mock;
+const lastRequest = (): Record<string, unknown> =>
+  mockProcessText.mock.calls[0][0] as Record<string, unknown>;
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  mockConfig = { cleanupEnabled: true, defaultMode: 'cloud', dictationAgentEnabled: true };
+  mockActiveMode = 'cloud';
+  mockCustomPrompt = 'Always use bullet points, {{agentName}}.';
+});
+
+describe('cleanupTranscript custom prompt — sent', () => {
+  it('passes the override with the agent name for ordinary keyboard dictation', async () => {
+    await cleanupTranscript('remind me to buy milk', { context: 'keyboard' });
+    const req = lastRequest();
+    expect(req.customPrompt).toBe('Always use bullet points, {{agentName}}.');
+    expect(req.agentName).toBe('OpenWhispr');
+    expect(req.timeoutMs).toBe(CLEANUP_TIMEOUT_MS);
+  });
+
+  it.each([undefined, 'recording', 'notes', 'meeting'] as const)(
+    'applies to the %s context too, matching desktop',
+    async (context) => {
+      await cleanupTranscript('some text', context ? { context } : {});
+      expect(lastRequest().customPrompt).toBe('Always use bullet points, {{agentName}}.');
+    },
+  );
+
+  // Saying the name gives no command, so the override still cleans the dictation.
+  it.each(['cloud', 'private'])(
+    'still sends it in %s mode when the name is spoken',
+    async (mode) => {
+      mockActiveMode = mode;
+      mockConfig = { cleanupEnabled: true, defaultMode: mode };
+      await cleanupTranscript('hey OpenWhispr rewrite this as a haiku', { context: 'keyboard' });
+      const req = lastRequest();
+      expect(req.customPrompt).toBe('Always use bullet points, {{agentName}}.');
+      expect(req.agentName).toBe('OpenWhispr');
+      expect(req.timeoutMs).toBe(CLEANUP_TIMEOUT_MS);
+    },
+  );
+});
+
+describe('cleanupTranscript custom prompt — regression guards', () => {
+  it('sends no customPrompt when the user has no override', async () => {
+    mockCustomPrompt = undefined;
+    await cleanupTranscript('remind me to buy milk', { context: 'keyboard' });
+    expect(lastRequest().customPrompt).toBeUndefined();
+  });
+
+  it('returns the raw text without a request when cleanup is disabled', async () => {
+    mockConfig = { cleanupEnabled: false, defaultMode: 'cloud' };
+    await expect(cleanupTranscript('um hello', { context: 'keyboard' })).resolves.toBe('um hello');
+    expect(mockProcessText).not.toHaveBeenCalled();
+  });
+});
+
+describe('cleanupTranscript privacy hint follows the resolved route', () => {
+  it('sends no privacy hint for a Cloud route, so a consented private-mode fallback is cleaned', async () => {
+    mockActiveMode = 'private';
+    mockConfig = { cleanupEnabled: true, defaultMode: 'private' };
+    await expect(
+      cleanupTranscript('um hello there', {
+        context: 'recording',
+        inferenceRoute: { mode: 'openwhispr', scope: 'cleanup' },
+      }),
+    ).resolves.toBe('cleaned:um hello there');
+    const req = lastRequest();
+    expect(req.inferenceRoute).toEqual({ mode: 'openwhispr', scope: 'cleanup' });
+    expect(req.routing).toBeUndefined();
+  });
+
+  it('sends provider cleanup in private mode to the provider the user saved for it', async () => {
+    mockActiveMode = 'private';
+    mockConfig = { cleanupEnabled: true, defaultMode: 'private' };
+    await cleanupTranscript('um hello there', {
+      context: 'recording',
+      inferenceRoute: {
+        mode: 'providers',
+        scope: 'cleanup',
+        providerId: 'openai',
+        modelId: 'gpt-4o-mini',
+        endpoint: 'https://api.openai.com/v1',
+        credentialRef: 'provider.openai',
+      },
+    });
+    expect(lastRequest().routing).toEqual({ sendToChosenProvider: true });
+  });
+});

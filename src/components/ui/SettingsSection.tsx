@@ -44,7 +44,7 @@ export const SettingsGroup: React.FC<SettingsGroupProps> = ({
 }) => {
   const baseClasses = "space-y-3 p-3 rounded-lg border";
   const variantClasses = {
-    default: "bg-card/50 dark:bg-surface-2/50 border-border/50 dark:border-border-subtle",
+    default: "bg-card/50 dark:bg-surface-2/50 border-border/70 dark:border-border-subtle",
     highlighted: "bg-primary/5 dark:bg-primary/10 border-primary/20 dark:border-primary/30",
   };
 
@@ -58,7 +58,7 @@ export const SettingsGroup: React.FC<SettingsGroupProps> = ({
 
 interface SettingsRowProps {
   label: string;
-  description?: string;
+  description?: React.ReactNode;
   children: React.ReactNode;
   className?: string;
 }
@@ -97,7 +97,7 @@ export function SettingsPanel({
 }) {
   return (
     <div
-      className={`rounded-lg border border-border/50 dark:border-border-subtle/70 bg-card/50 dark:bg-surface-2/50 backdrop-blur-sm divide-y divide-border/30 dark:divide-border-subtle/50 ${className}`}
+      className={`rounded-lg border border-border/70 dark:border-border-subtle/70 bg-card/50 dark:bg-surface-2/50 divide-y divide-border/60 dark:divide-border-subtle/50 ${className}`}
     >
       {children}
     </div>
@@ -118,6 +118,14 @@ export function SettingsPanelRow({
   );
 }
 
+export function SectionLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70 mb-2 ps-1">
+      {children}
+    </div>
+  );
+}
+
 export function SectionHeader({ title, description }: { title: string; description?: string }) {
   return (
     <div className="mb-3">
@@ -133,6 +141,8 @@ export interface InferenceModeOption {
   id: InferenceMode;
   disabled?: boolean;
   badge?: string;
+  /** Clicking the tile asks the user to sign in, so it reads as an action, not as disabled. */
+  signInRequired?: boolean;
   label: string;
   description: string;
   icon: React.ReactNode;
@@ -154,17 +164,18 @@ export function InferenceModeSelector({
       {modes.map((mode) => {
         const isActive = activeMode === mode.id;
         const isDisabled = !!mode.disabled;
+        const isDimmed = isDisabled && !mode.signInRequired;
         return (
           <SettingsPanelRow
             key={mode.id}
             className={`transition-colors ${
-              isDisabled ? "" : "hover:bg-foreground/3 dark:hover:bg-white/3"
+              isDimmed ? "" : "hover:bg-foreground/3 dark:hover:bg-white/3"
             }`}
           >
             <button
               onClick={() => onSelect(mode.id)}
-              className={`w-full flex items-center gap-3 text-left cursor-pointer group ${
-                isDisabled ? "opacity-60" : ""
+              className={`w-full flex items-center gap-3 text-start cursor-pointer group ${
+                isDimmed ? "opacity-60" : ""
               }`}
             >
               <div
@@ -186,6 +197,11 @@ export function InferenceModeSelector({
                   {isActive && !isDisabled && (
                     <span className="text-xs font-medium text-primary bg-primary/10 dark:bg-primary/15 px-1.5 py-px rounded-sm">
                       {t("common.active")}
+                    </span>
+                  )}
+                  {mode.signInRequired && (
+                    <span className="text-xs font-medium text-primary bg-primary/10 dark:bg-primary/15 px-1.5 py-px rounded-sm group-hover:underline">
+                      {t("common.signInRequired")}
                     </span>
                   )}
                   {isDisabled && mode.badge && (

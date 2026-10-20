@@ -1,7 +1,7 @@
 import { useCallback } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { useTranslation } from "react-i18next";
-import { Cloud, Key, Cpu, Network, Building2, ShieldCheck, AlertTriangle } from "lucide-react";
+import { Cloud, Key, Cpu, Network, Building2, ShieldCheck, AlertTriangle } from "../icons";
 import {
   LLM_ENTERPRISE_POLICY_PROVIDER_IDS,
   LLM_POLICY_PROVIDER_IDS,
@@ -9,6 +9,7 @@ import {
   selectPolicyEffectiveSettings,
   selectResolvedLLMConfig,
   setResolvedLLMConfig,
+  type ResolvedLLMConfig,
 } from "../../stores/settingsStore";
 import { usePolicyModeOptions, usePolicySnapshot } from "../../hooks/usePolicy";
 import { InferenceModeSelector } from "../ui/SettingsSection";
@@ -17,19 +18,25 @@ import ReasoningModelSelector from "../ReasoningModelSelector";
 import EnterpriseSection from "../EnterpriseSection";
 import OpenAICompatiblePanel from "../OpenAICompatiblePanel";
 import { Toggle } from "../ui/toggle";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
 import type { InferenceMode } from "../../types/electron";
-import type { InferenceScope } from "../../config/inferenceScopes";
 import {
-  isProviderValidForMode,
-  getCloudModel,
-  getLocalModel,
-  enterpriseProviderName,
-} from "../../models/ModelRegistry";
+  INFERENCE_SCOPES,
+  type InferenceScope,
+  type InferenceScopeDefinition,
+} from "../../config/inferenceScopes";
+import { getCloudModel, getLocalModel, enterpriseProviderName } from "../../models/ModelRegistry";
+import { AUTO_REASONING_EFFORT, isReasoningEffortSupported } from "../../models/reasoningEffort";
+import { selectableReasoningEffort } from "../../services/ai/chatRequestBody";
 import { useManagedScopeResolution } from "../../stores/enterpriseIdentityStore";
+import { modeSwitchPatch } from "../../utils/llmModeSwitch";
+import { requestSignIn } from "../../utils/requestSignIn";
 import TestConnectionButton from "../TestConnectionButton";
 import { getEnterpriseCallSettings } from "../../services/ai/enterpriseSettings";
 import { Button } from "../ui/button";
-import { useStartOnboarding } from "../../hooks/useStartOnboarding";
+
+// Radix Select can't hold an empty value, so Auto ("") gets a sentinel.
+const AUTO_REASONING_EFFORT_VALUE = "__auto__";
 
 const MODE_LABEL_PREFIX: Record<InferenceScope, string> = {
   dictationCleanup: "settingsPage.aiModels.modes",
@@ -53,14 +60,21 @@ export default function InferenceConfigEditor({
   allowedModes,
 }: InferenceConfigEditorProps) {
   const { t } = useTranslation();
-  const startOnboarding = useStartOnboarding();
   const policyState = usePolicySnapshot();
   const config = useSettingsStore(
-    useShallow((settings) =>
-      selectResolvedLLMConfig(selectPolicyEffectiveSettings(settings, policyState), scope)
-    )
+    useShallow((settings): ResolvedLLMConfig => {
+      const effective = selectPolicyEffectiveSettings(settings, policyState);
+      const resolved = selectResolvedLLMConfig(effective, scope);
+      const definition: InferenceScopeDefinition = INFERENCE_SCOPES[scope];
+      // Inherited runtime defaults are not an explicit selection in an optional picker.
+      return definition.optional
+        ? { ...resolved, model: effective[definition.storeKeys.model] as string }
+        : resolved;
+    })
   );
   const isSignedIn = useSettingsStore((s) => s.isSignedIn);
+  const keepLocalModelLoaded = useSettingsStore((s) => s.keepLocalModelLoaded);
+  const setKeepLocalModelLoaded = useSettingsStore((s) => s.setKeepLocalModelLoaded);
   const enterpriseSetupMode = useSettingsStore((s) => s.enterpriseSetupMode);
   const setEnterpriseSetupMode = useSettingsStore((s) => s.setEnterpriseSetupMode);
   const managed = useManagedScopeResolution(scope, enterpriseSetupMode);
@@ -76,7 +90,7 @@ export default function InferenceConfigEditor({
           description: t(`${prefix}.openwhisprDesc`),
           icon: <Cloud className="w-4 h-4" />,
           disabled: !isSignedIn,
-          badge: !isSignedIn ? t("common.freeAccountRequired") : undefined,
+          signInRequired: !isSignedIn,
         },
         {
           id: "providers",
@@ -124,36 +138,18 @@ export default function InferenceConfigEditor({
     (mode: InferenceMode) => {
       if (!isModeAllowed(mode)) return;
       if (mode === "openwhispr" && !isSignedIn) {
-        startOnboarding();
+        requestSignIn();
         return;
       }
       if (mode === effectiveMode) return;
 
-      const patch: Parameters<typeof setResolvedLLMConfig>[1] = {
-        mode,
-        cloudMode: mode === "openwhispr" ? "openwhispr" : "byok",
-      };
-      if (!isProviderValidForMode(config.provider, mode)) {
-        patch.provider = "";
-        patch.model = "";
-      }
-      setResolvedLLMConfig(scope, patch);
-
-      if (mode === "openwhispr" || mode === "self-hosted" || mode === "enterprise") {
-        window.electronAPI?.llamaServerStop?.();
-      }
-
+      setResolvedLLMConfig(
+        scope,
+        modeSwitchPatch({ provider: config.provider, model: config.model }, mode)
+      );
       onModeChange?.(mode);
     },
-    [
-      scope,
-      config.provider,
-      effectiveMode,
-      isSignedIn,
-      onModeChange,
-      isModeAllowed,
-      startOnboarding,
-    ]
+    [scope, config.provider, config.model, effectiveMode, isSignedIn, onModeChange, isModeAllowed]
   );
 
   const setMode = setField("mode");
@@ -182,6 +178,11 @@ export default function InferenceConfigEditor({
         config.provider === "openrouter" ||
         !!getCloudModel(config.model)?.supportsThinking)) ||
     (effectiveMode === "local" && !!getLocalModel(config.model)?.supportsThinking);
+
+  const effortCapability =
+    effectiveMode === "providers"
+      ? selectableReasoningEffort(config.provider, config.model, config, config.cloudBaseUrl)
+      : null;
 
   if (managed.kind === "error") {
     return (
@@ -221,7 +222,7 @@ export default function InferenceConfigEditor({
             </p>
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-2 border-t border-border/60 pt-3">
+        <div className="flex flex-wrap items-center gap-2 border-t border-border/70 pt-3">
           <TestConnectionButton
             provider={managed.provider}
             getConfig={() => ({
@@ -269,7 +270,13 @@ export default function InferenceConfigEditor({
           </Button>
         </div>
       )}
-      <InferenceModeSelector modes={modes} activeMode={effectiveMode} onSelect={handleModeSelect} />
+      {modes.length > 1 && (
+        <InferenceModeSelector
+          modes={modes}
+          activeMode={effectiveMode}
+          onSelect={handleModeSelect}
+        />
+      )}
 
       {effectiveMode === "providers" && renderModelSelector("cloud")}
       {effectiveMode === "local" && renderModelSelector("local")}
@@ -300,6 +307,66 @@ export default function InferenceConfigEditor({
             <p className="text-xs text-muted-foreground">{t("reasoning.disableThinking.help")}</p>
           </div>
           <Toggle checked={config.disableThinking} onChange={setField("disableThinking")} />
+        </div>
+      )}
+
+      {effortCapability && (
+        <div className="flex items-start justify-between gap-3 pt-1">
+          <div className="flex-1 min-w-0">
+            <h4 className="text-sm font-medium text-foreground">{t("reasoning.effort.title")}</h4>
+            <p className="text-xs text-muted-foreground">
+              {effortCapability.defaultValue
+                ? t("reasoning.effort.descriptionWithDefault", {
+                    value: t(`reasoning.effort.options.${effortCapability.defaultValue}`),
+                  })
+                : t("reasoning.effort.description")}
+            </p>
+          </div>
+          <Select
+            value={
+              isReasoningEffortSupported(effortCapability, config.reasoningEffort)
+                ? config.reasoningEffort
+                : AUTO_REASONING_EFFORT_VALUE
+            }
+            onValueChange={(value) =>
+              setField("reasoningEffort")(
+                value === AUTO_REASONING_EFFORT_VALUE ? AUTO_REASONING_EFFORT : value
+              )
+            }
+          >
+            <SelectTrigger className="h-7 w-44 shrink-0 text-xs rounded-lg px-2.5 [&>svg]:h-3 [&>svg]:w-3">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem
+                value={AUTO_REASONING_EFFORT_VALUE}
+                className="text-xs py-1.5 ps-2.5 pe-7 rounded-md"
+              >
+                {t("reasoning.effort.auto")}
+              </SelectItem>
+              {effortCapability.options.map((effort) => (
+                <SelectItem
+                  key={effort}
+                  value={effort}
+                  className="text-xs py-1.5 ps-2.5 pe-7 rounded-md"
+                >
+                  {t(`reasoning.effort.options.${effort}`)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
+      {effectiveMode === "local" && (
+        <div className="flex items-start justify-between gap-3 pt-1">
+          <div className="flex-1 min-w-0">
+            <h4 className="text-sm font-medium text-foreground">
+              {t("reasoning.keepModelLoaded.label")}
+            </h4>
+            <p className="text-xs text-muted-foreground">{t("reasoning.keepModelLoaded.help")}</p>
+          </div>
+          <Toggle checked={keepLocalModelLoaded} onChange={setKeepLocalModelLoaded} />
         </div>
       )}
 

@@ -1,18 +1,26 @@
+const { OrukeetStreaming, MANAGED_STREAM_OPTIONS } = require("./orukeetStreaming");
+const { connectManagedOrukeet } = require("./orukeetCloudSession");
 const { ipcMain, app, shell, BrowserWindow, systemPreferences, net, session } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
+const { isRestorablePasteTarget } = require("./windowsPasteTarget");
 const crypto = require("crypto");
 const debugLogger = require("./debugLogger");
+const { ANALYTICS_HISTORY_BACKFILL_VERSION } = require("./analytics");
 const { PARAKEET_UNSUPPORTED_OS_CODE } = require("./parakeetCapability");
 const { getModelType, isSherpaLocalProvider } = require("./parakeetModelInfo");
 const { broadcastToWindows } = require("./windowBroadcast");
 const { openExternalUrl } = require("./externalUrlOpener");
 const { resolveFailedGpuBackends } = require("./whisper");
+const { WHISPER_GPU_FAILURE_REASON_KEYS } = require("./whisperGpuFailureReason");
 const { BYOK_API_KEYS } = require("../config/secretKeys");
 const tokenStore = require("./tokenStore");
 const accountScopeBinding = require("./accountScopeBinding");
+const { registerProductHelpIpc, remoteHelpPolicyState } = require("./productHelp");
 const { createCloudApiRequestHandler } = require("./cloudApiRequest");
+const { MetaActivation } = require("./metaActivation");
+const { decodeLeaderboardPngDataUrl, leaderboardImageFilename } = require("./leaderboardImage");
 const { withPolicyRequestHeaders } = require("./policyRequestHeaders");
 const {
   createWorkspacePolicyManager,
@@ -28,12 +36,31 @@ const {
 } = require("./policyResponseError");
 const { classifyAndLog } = require("./networkErrors");
 const { resolveSystemDefaultMicrophone } = require("./systemDefaultMicrophone");
+const { ipcErrorFields } = require("./ipcErrorFields");
+const {
+  PROVIDER_ERROR_CODES,
+  isProviderSettingsTarget,
+  providerHttpError,
+  providerError,
+  asProviderError,
+  redactProviderBody,
+} = require("./providerHttpErrors");
+const {
+  registerConnectorIpc,
+  createConnectorPolicyResolver,
+  createConnectorAuthLookup,
+} = require("./connectors/connectorIpc");
+const { createNoteAttendeesLookup, searchContacts } = require("./connectors/contactSearch");
 // The renderer's ModelRegistry is not main-loadable; the raw registry data is
 // packaged, and the route resolver only needs {id, baseUrl} per provider.
 const transcriptionProviderBaseUrls = () =>
   require("../models/modelRegistryData.json").transcriptionProviders;
+// Classified errors show the provider's display name; routes only carry its id.
+const transcriptionProviderName = (id) =>
+  require("../models/modelRegistryData.json").transcriptionProviders.find((p) => p.id === id)
+    ?.name || id;
 // ipcMain.handle keeps only the message when a promise rejects, dropping custom
-// props — proxy handlers return {error, code, messageKey} so the renderer can
+// props — proxy handlers return the classified fields so the renderer can
 // rebuild the error.
 const serializeIpcError =
   (fn) =>
@@ -41,9 +68,43 @@ const serializeIpcError =
     try {
       return await fn(...args);
     } catch (error) {
-      return { error: error.message, code: error.code, messageKey: error.messageKey };
+      return ipcErrorFields(error);
     }
   };
+
+// Analytics uploads cross two asynchronous boundaries: renderer -> main and
+// main -> cloud. Pin every local queue operation to the same authenticated
+// account generation so a delayed pass cannot adopt a replacement session.
+function assertAnalyticsSyncContext(context) {
+  if (context == null) return null;
+  const state = tokenStore.getState();
+  if (
+    typeof context !== "object" ||
+    typeof context.accountId !== "string" ||
+    context.accountId.length === 0 ||
+    !Number.isInteger(context.authGeneration) ||
+    !state.token ||
+    state.generation !== context.authGeneration
+  ) {
+    throw Object.assign(new Error("Authentication context changed during analytics sync"), {
+      code: "AUTH_CONTEXT_CHANGED",
+    });
+  }
+  return context.accountId;
+}
+// Local engines resolve a failed decode instead of throwing. Retry turns that
+// into a coded error so the toast says what went wrong rather than blaming a
+// missing engine.
+function localTranscriptionFailure(result) {
+  const error = new Error(result.message || result.error || "Local transcription failed");
+  if (result.code === "NO_SPEECH_DETECTED" || result.message === "No audio detected") {
+    error.code = "NO_SPEECH_DETECTED";
+  } else if (result.error === "invalid_response") {
+    error.code = "INVALID_RESPONSE";
+    error.messageKey = "controlPanel.history.retryErrors.invalidResponse";
+  }
+  return error;
+}
 // Which diarization dialect a resolved endpoint speaks, for Custom endpoints
 // that front a known provider. Null when the host offers no known dialect.
 const diarizationHost = (endpoint) => {
@@ -54,16 +115,18 @@ const diarizationHost = (endpoint) => {
   } catch {}
   return null;
 };
-const { resolveLocalServerNeeds } = require("./localServerPolicy");
+const { resolveLocalServerNeeds, shouldStopLocalServer } = require("./localServerPolicy");
 const autoStart = require("./autoStart");
+const { getRelaunchOptions, getRelaunchWaiter } = require("./autoStartPolicy");
 const HyprlandShortcutManager = require("./hyprlandShortcut");
 const AssemblyAiStreaming = require("./assemblyAiStreaming");
 const { i18nMain, changeLanguage } = require("./i18nMain");
 const DeepgramStreaming = require("./deepgramStreaming");
+const { GeminiLiveStreaming, GEMINI_LIVE_MODEL } = require("./geminiLiveStreaming");
 const CortiStreaming = require("./cortiStreaming");
 const OpenAIRealtimeStreaming = require("./openaiRealtimeStreaming");
 const { getCortiToken } = require("./cortiAuth");
-const { ONBOARDING_DEMO_KINDS } = require("./onboardingInputPolicy");
+const { ONBOARDING_DEMO_KINDS, ONBOARDING_DEMO_STATUSES } = require("./onboardingInputPolicy");
 const { focusWindowsHotkeyCaptureWindow } = require("./hotkeyCaptureFocus");
 const { createTinfoilRealtimeSocket } = require("./tinfoilSecureClient");
 const { TINFOIL_REALTIME_MODEL } = require("./tinfoilRealtimeStreaming");
@@ -74,11 +137,11 @@ const AudioStorageManager = require("./audioStorage");
 const LocalModelDownloadStatus = require("./localModelDownloadStatus");
 const AgentStreamRequestRegistry = require("./agentStreamRequestRegistry");
 const createMeetingTranscriptionLifecycle = require("./meetingTranscriptionLifecycle");
-const { registerMeetingAutoEndLifecycleHandlers } = require("./meetingAutoEndLifecycle");
 const liveSpeakerIdentifier = require("./liveSpeakerIdentifier");
 const { supportsLiveSpeakerIdentification } = require("./liveSpeakerIdPolicy");
 const MeetingEchoLeakDetector = require("./meetingEchoLeakDetector");
 const createMeetingSystemAudioWatchdog = require("./meetingSystemAudioWatchdog");
+const createMeetingSystemAudioHandover = require("./meetingSystemAudioHandover");
 const {
   partitionPendingMicFinals,
   isRiskyMicDuplicateProfile,
@@ -92,6 +155,7 @@ const {
   MEETING_MIC_SILENCE_RMS,
   MEETING_MIC_SILENCE_PEAK,
 } = require("./meetingMicGate");
+const { deriveDetectorPreferences } = require("./meetingDetectionPreferencePolicy");
 const { resolveDiarizationInput } = require("./meetingDiarizationInput");
 const { applySmartSpacing } = require("./smartSpacing");
 const { applyAutoLearnSetting } = require("./autoLearnSetting");
@@ -111,6 +175,11 @@ const {
   isSpeakerLocked,
 } = require("./speakerAssignmentPolicy");
 const { normalizeStoredSpeakerCount } = require("./speakerCount");
+const {
+  buildSpeakerRenumber,
+  normalizeSpeakerIndexBase,
+  resolveSpeakerIndexBase,
+} = require("./speakerIndexBase");
 const { downsample24kTo16k, pcm16ToWav } = require("../utils/audioUtils");
 const postMigrationDetector = require("./postMigrationDetector");
 const screenContextCapture = require("./screenContextCapture");
@@ -118,6 +187,8 @@ const {
   DEFAULT_EXPECTED_SPEAKER_COUNT,
   MAX_SPEAKER_COUNT,
 } = require("../constants/speakerDetection.json");
+const { UPLOAD_AUDIO_EXTENSIONS } = require("../constants/uploadAudioFormats.json");
+const { providerContentType, prepareProviderUpload } = require("./providerUploadAudio");
 const {
   DEFAULT_WHISPER_VAD_CONFIG,
   sanitizeWhisperVadConfig,
@@ -129,7 +200,11 @@ const {
   getMeetingStreamingClient,
   getMeetingConnectionKey,
 } = require("./meetingStreamingProviders");
-const { fetchRealtimeTokenForProvider } = require("./realtimeTokenProviders");
+const {
+  createServerTokenPoster,
+  fetchRealtimeTokenForProvider,
+  isSignInRefusal,
+} = require("./realtimeTokenProviders");
 const { getCalendarAvailability } = require("./calendarAvailabilityService");
 
 // Meeting capture runs at 24 kHz (see meetingRecordingStore AudioContext); cloud
@@ -154,18 +229,6 @@ const AUTO_LEARN_DEBOUNCE_MS = 1500;
 // the message reports the cap that actually applied.
 const byokSizeCapError = (sizeCapBytes) =>
   `File too large. Maximum size for bring-your-own-key is ${Math.floor(sizeCapBytes / (1024 * 1024))} MB.`;
-
-const AUDIO_MIME_TYPES = {
-  mp3: "audio/mpeg",
-  wav: "audio/wav",
-  m4a: "audio/mp4",
-  webm: "audio/webm",
-  ogg: "audio/ogg",
-  oga: "audio/ogg",
-  flac: "audio/flac",
-  aac: "audio/aac",
-  opus: "audio/ogg",
-};
 
 const CLOUD_INLINE_LIMIT = 4 * 1024 * 1024;
 // The enterprise "Test Connection" probe only needs one word back, but the
@@ -243,6 +306,7 @@ const {
   formatSpeakerTranscript,
 } = require("./speakerMerge");
 const { timestampRequestFields, mapVerboseSegments } = require("./uploadTimestamps");
+const { listLocalTranscriptionModels } = require("./localTranscriptionModels");
 
 // Canonicalize allowed dirs so realpath'd inputs match on macOS (/var -> /private/var).
 // Deliberately narrow: user-picked paths anywhere else are approved individually via
@@ -351,7 +415,7 @@ function interpretTranscribeResponse(data) {
     throw Object.assign(new Error("Request timed out"), { code: "SERVER_ERROR" });
   }
   if (data.statusCode === 429) {
-    throw Object.assign(new Error("Daily word limit reached"), {
+    throw Object.assign(new Error("Weekly Cloud word limit reached"), {
       code: "LIMIT_REACHED",
       ...data.data,
     });
@@ -567,6 +631,18 @@ async function chunkedCloudTranscribe({
   }
 }
 
+// Cleanup toast wording for replies the main-process providers reject; mirror
+// TRUNCATED_/EMPTY_OUTPUT_MESSAGE_KEY in services/ai/chatRequestBody.ts (#2091).
+const CLEANUP_TRUNCATED_MESSAGE_KEY = "hooks.audioRecording.errorDescriptions.cleanupTruncated";
+const CLEANUP_EMPTY_REPLY_MESSAGE_KEY = "hooks.audioRecording.errorDescriptions.cleanupEmptyReply";
+
+const {
+  isMeetingFolderRef,
+  resolveMeetingDestination,
+  rememberMeetingDestination,
+  meetingDestinationContext,
+} = require("./meetingNotificationDestination");
+
 class IPCHandlers {
   constructor(managers) {
     this.environmentManager = managers.environmentManager;
@@ -585,6 +661,7 @@ class IPCHandlers {
     this.whisperCudaManager = managers.whisperCudaManager;
     this.whisperVulkanManager = managers.whisperVulkanManager;
     this.googleCalendarManager = managers.googleCalendarManager;
+    this.connectorManager = managers.connectorManager;
     this.microsoftCalendarManager = managers.microsoftCalendarManager;
     this.appleCalendarManager = managers.appleCalendarManager;
     this.meetingDetectionEngine = managers.meetingDetectionEngine;
@@ -592,7 +669,7 @@ class IPCHandlers {
     this.linuxPortalAudioManager = managers.linuxPortalAudioManager;
     this.windowsLoopbackAudioManager = managers.windowsLoopbackAudioManager;
     this.meetingAecManager = managers.meetingAecManager;
-    this.getQdrantManager = managers.getQdrantManager;
+    this.getSemanticSearch = managers.getSemanticSearch;
     this.oauthProtocolRegistered = managers.oauthProtocolRegistered === true;
     this.oauthProtocol = managers.oauthProtocol || "openwhispr";
     this.sessionId = crypto.randomUUID();
@@ -608,6 +685,7 @@ class IPCHandlers {
     this._micHoldSenders = new Map();
     this.assemblyAiStreaming = null;
     this.deepgramStreaming = null;
+    this.geminiStreaming = null;
     this.cortiStreaming = null;
     this._dictationStreaming = null;
     this._dictationConnectPromise = null;
@@ -629,8 +707,15 @@ class IPCHandlers {
     this._retentionSettingsSynced = false;
     this._noteFilesEnabled = false;
     this._granolaImportPending = null;
+    this._analyticsHistoryBackfillPromise = null;
     this.speakerDiarizationEnabled = true;
+    // Default for the saved process-detection toggle. The engine keeps both detectors
+    // off until the renderer syncs (see meetingDetectionPreferencePolicy.js).
+    this.meetingProcessDetection = true;
     this.activeMeetingSpeakerConfig = null;
+    // Diarization session id → { noteId, ceiling }: speaker ids a stopped session's
+    // diarization may still write to its note (see _resolveMeetingSpeakerIndexBase).
+    this._diarizationSpeakerReservations = new Map();
     this.whisperVadSettings = {
       dictationSileroEnabled: false,
       noteRecordingSileroEnabled: true,
@@ -641,41 +726,248 @@ class IPCHandlers {
     this._setupTextEditMonitor();
     this._setupRetentionCleanup();
     this._logDetectedGpus();
+    // Warm the OS default mic answer before the first hotkey press (~2s on Windows).
+    resolveSystemDefaultMicrophone();
     this.setupHandlers();
     // Lives for the app's lifetime; IPCHandlers has no teardown path.
-    tokenStore.subscribe(({ generation, token }) => {
-      this.enterpriseIdentityManager?.clear();
-      if (!token) {
-        this.databaseManager.setActiveAccountId(null);
-        accountScopeBinding.clear();
-        broadcastToWindows("active-account-scope-changed", null);
-      }
-      broadcastToWindows("auth-token-state-changed", {
-        generation,
-        hasToken: Boolean(token),
-      });
-    });
+    tokenStore.subscribe((state) => this._handleAuthTokenChange(state));
 
     if (this.whisperManager?.serverManager) {
-      // Remember the failed backend so it isn't re-attempted (and its model
-      // reload re-paid) on every launch; cleared by retry, re-download, delete.
-      this.whisperManager.serverManager.on("cuda-fallback", () => {
-        this._recordWhisperGpuFailure("cuda");
-        broadcastToWindows("cuda-fallback-notification", {});
-      });
-      this.whisperManager.serverManager.on("gpu-fallback", () => {
-        this._recordWhisperGpuFailure("vulkan");
-        broadcastToWindows("gpu-fallback-notification", {});
-      });
-      // Persist the discrete-GPU pin so later launches spawn pinned directly
-      // instead of paying a second Vulkan cold start. See #1606.
-      this.whisperManager.serverManager.on("vulkan-device-pinned", ({ index }) => {
-        this._syncStartupEnv({ WHISPER_VULKAN_DEVICE: String(index) });
-      });
-      this.whisperManager.serverManager.on("vulkan-device-pin-cleared", () => {
-        this._syncStartupEnv({}, ["WHISPER_VULKAN_DEVICE"]);
+      this._attachWhisperServerListeners(this.whisperManager.serverManager);
+    }
+  }
+
+  createFolderWithEffects(name, spaceId) {
+    const result = this.databaseManager.createFolder(name, spaceId);
+    if (result?.success && result?.folder) {
+      setImmediate(() => {
+        broadcastToWindows("folder-created", result.folder);
+        if (this._noteFilesEnabled) {
+          const markdownMirror = require("./markdownMirror");
+          markdownMirror.ensureFolder(result.folder.name);
+        }
       });
     }
+    return result;
+  }
+
+  getMeetingNotificationDestination(owner) {
+    if (!this.windowManager.isMeetingNotificationOwner(owner))
+      return { success: false, code: "STALE_NOTIFICATION" };
+    try {
+      const context = meetingDestinationContext(
+        this.databaseManager,
+        owner,
+        this.windowManager.meetingRecentDestinations
+      );
+      this.windowManager.meetingRecentDestinations = context.recentDestinations;
+      return { success: true, value: context };
+    } catch (error) {
+      return {
+        success: false,
+        code: error.code === "NOTE_UNAVAILABLE" ? error.code : "FOLDERS_UNAVAILABLE",
+      };
+    }
+  }
+
+  selectMeetingNotificationFolder(owner, ref) {
+    const result = this.getMeetingNotificationDestination(owner);
+    if (!result.success) return result;
+    if (result.value.existingNote)
+      return { success: false, code: "LINKED_NOTE_CHANGED", context: result.value };
+    if (!isMeetingFolderRef(ref)) return { success: false, code: "INVALID_REQUEST" };
+    const folder = result.value.folders.find(
+      (f) => f.id === ref.folderId && f.space_id === ref.spaceId
+    );
+    if (!folder) return { success: false, code: "FOLDER_UNAVAILABLE" };
+    owner.selectedDestination = { folderId: folder.id, spaceId: folder.space_id };
+    this.windowManager.meetingRecentDestinations = rememberMeetingDestination(
+      this.windowManager.meetingRecentDestinations,
+      owner.selectedDestination
+    );
+    return {
+      success: true,
+      value: {
+        ...result.value,
+        selectedDestination: owner.selectedDestination,
+        recentDestinations: this.windowManager.meetingRecentDestinations,
+      },
+    };
+  }
+
+  createMeetingNotificationFolder(owner, request) {
+    if (!this.windowManager.isMeetingNotificationOwner(owner))
+      return { success: false, code: "STALE_NOTIFICATION" };
+    if (
+      !request ||
+      typeof request.requestId !== "string" ||
+      !request.requestId.trim() ||
+      request.requestId.length > 128 ||
+      typeof request.name !== "string" ||
+      !Number.isSafeInteger(request.spaceId) ||
+      request.spaceId <= 0
+    )
+      return { success: false, code: "INVALID_REQUEST" };
+    const name = request.name.trim();
+    if (!name) return { success: false, code: "FOLDER_NAME_REQUIRED" };
+    const cached = owner.createRequests.get(request.requestId);
+    if (cached && (cached.name !== name || cached.spaceId !== request.spaceId))
+      return { success: false, code: "INVALID_REQUEST" };
+    // Bound per-prompt retry bookkeeping. Successful IDs stay stable for the prompt's lifetime.
+    if (!cached && owner.createRequests.size >= 32)
+      return { success: false, code: "INVALID_REQUEST" };
+    const contextResult = this.getMeetingNotificationDestination(owner);
+    if (!contextResult.success) return contextResult;
+    if (contextResult.value.existingNote)
+      return { success: false, code: "LINKED_NOTE_CHANGED", context: contextResult.value };
+    if (!contextResult.value.spaces.some((space) => space.id === request.spaceId))
+      return { success: false, code: "SPACE_UNAVAILABLE" };
+    try {
+      let ref = cached?.ref;
+      if (ref) {
+        if (!resolveMeetingDestination(this.databaseManager, ref))
+          return { success: false, code: "FOLDER_UNAVAILABLE" };
+      } else {
+        const result = this.createFolderWithEffects(name, request.spaceId);
+        if (!result?.success || !result.folder)
+          return {
+            success: false,
+            code:
+              result?.error === "A folder with that name already exists"
+                ? "FOLDER_NAME_TAKEN"
+                : result?.error === "Space not found"
+                  ? "SPACE_UNAVAILABLE"
+                  : "CREATE_FAILED",
+          };
+        ref = { folderId: result.folder.id, spaceId: result.folder.space_id };
+        owner.createRequests.set(request.requestId, { name, spaceId: request.spaceId, ref });
+        this.windowManager.sendToControlPanel("meeting-notification-folder-created", {
+          folderId: ref.folderId,
+        });
+      }
+      const refreshed = this.getMeetingNotificationDestination(owner);
+      return refreshed.success
+        ? { success: true, value: { ...refreshed.value, createdFolder: ref } }
+        : refreshed;
+    } catch {
+      return { success: false, code: "CREATE_FAILED" };
+    }
+  }
+
+  _handleAuthTokenChange({ generation, token }) {
+    this.windowManager.retireMeetingNotificationScope();
+    this.enterpriseIdentityManager?.clear();
+    if (!token) {
+      this.databaseManager.setActiveAccountId(null);
+      accountScopeBinding.clear();
+      broadcastToWindows("active-account-scope-changed", null);
+      // As set-active-account-scope does: a connect can't outlive its account.
+      this.connectorManager?.accountChanged();
+    }
+    broadcastToWindows("auth-token-state-changed", {
+      generation,
+      hasToken: Boolean(token),
+    });
+    // A sign-out or another account changes whose login shows.
+    void this.connectorManager?.notifyStatusChanged();
+  }
+
+  // Reconstructing counters from the transcripts already on disk records exactly
+  // what "keep local history" turns off, so it answers to the same switch the
+  // live path checks in audioManager.saveTranscription. The main process boots
+  // with defaults rather than the user's choice, so an unsynced setting is not
+  // consent either -- the renderer's first sync is what starts this (#1370).
+  _canReconstructAnalyticsHistory() {
+    return this._retentionSettingsSynced && this._retentionSettings.dataRetentionEnabled;
+  }
+
+  /** Whether a signed-in account is bound to this install. */
+  _hasActiveAccountScope() {
+    return Boolean(accountScopeBinding.read());
+  }
+
+  // The switch alone is not enough to start: a managed workspace can force local
+  // history off, and that policy arrives over the network while this scan takes
+  // milliseconds, so the renderer reports the permissive personal default until
+  // it lands. Waiting for the real answer is only possible where there is one --
+  // signed out the policy store stays idle forever and the user's own preference
+  // is the only authority there is. Mid-scan arrival needs no separate check:
+  // a policy that resolves "always_off" flips the switch, which the loop reads.
+  _mayStartAnalyticsHistoryReconstruction() {
+    if (!this._canReconstructAnalyticsHistory()) return false;
+    if (this._retentionSettings.localHistoryPolicyResolved === true) return true;
+    return !this._hasActiveAccountScope();
+  }
+
+  // Reconciliation is best-effort. Analytics reads await it so later-eligible
+  // history shows up before the numbers are read, which means a failure here
+  // must never fail the read itself: a broken scan would otherwise blank an
+  // Insights summary that SQLite could have answered perfectly well.
+  async _ensureAnalyticsHistoryBackfilled() {
+    if (!this._mayStartAnalyticsHistoryReconstruction()) return { inserted: 0, scanned: 0 };
+    if (this._analyticsHistoryBackfillPromise) return this._analyticsHistoryBackfillPromise;
+    // The failure is absorbed inside this promise rather than around the
+    // creator's await, because callers that join an in-flight pass are handed
+    // this promise directly and would otherwise receive the raw rejection --
+    // which is every analytics read that arrives while the startup pass is
+    // still scanning.
+    const backfillPromise = (async () => {
+      let inserted = 0;
+      let scanned = 0;
+      let skipped = 0;
+      let stoppedEarly = false;
+      const state = this.databaseManager.getAnalyticsHistoryBackfillState(
+        ANALYTICS_HISTORY_BACKFILL_VERSION
+      );
+      if (state.scannedThroughId >= state.targetId) return { inserted, scanned };
+      while (true) {
+        // The database reads its persisted cursor again for every batch. An
+        // older row made eligible while this pass yields can move that cursor
+        // backward without being overwritten by stale in-memory progress.
+        const batch = this.databaseManager.backfillAnalyticsHistoryBatch({
+          throughId: state.targetId,
+          checkpointVersion: ANALYTICS_HISTORY_BACKFILL_VERSION,
+        });
+        inserted += batch.inserted;
+        scanned += batch.scanned;
+        skipped += batch.skipped;
+        if (batch.complete) break;
+        await new Promise((resolve) => setImmediate(resolve));
+        // The switch can be turned off while this pass yields -- by the user, or
+        // by a managed policy that resolved after the renderer's first sync sent
+        // the personal default. Re-reading it here stops the scan at the next
+        // batch boundary instead of mining the rest of a history the user has
+        // just opted out of.
+        if (!this._canReconstructAnalyticsHistory()) {
+          stoppedEarly = true;
+          break;
+        }
+      }
+      if (inserted > 0) broadcastToWindows("analytics-changed");
+      if (scanned > 0) {
+        debugLogger.info(
+          stoppedEarly
+            ? "Analytics history backfill stopped: local history was turned off mid-scan"
+            : "Analytics history backfill complete",
+          { inserted, skipped, scanned },
+          "analytics"
+        );
+      }
+      return { inserted, scanned };
+    })().catch((error) => {
+      debugLogger.error("Analytics history backfill failed", { error: error.message }, "analytics");
+      return { inserted: 0, scanned: 0 };
+    });
+    this._analyticsHistoryBackfillPromise = backfillPromise;
+    // Cleared after the assignment above, never inside the pass: a scan that
+    // finishes without ever awaiting would otherwise strand its own resolved
+    // promise here and every later read would join a pass that already ended.
+    void backfillPromise.then(() => {
+      if (this._analyticsHistoryBackfillPromise === backfillPromise) {
+        this._analyticsHistoryBackfillPromise = null;
+      }
+    });
+    return backfillPromise;
   }
 
   // The dictation slot reports its own changes from the renderer. Slots
@@ -739,6 +1031,30 @@ class IPCHandlers {
     return this._getWhisperVadSettings();
   }
 
+  // Shared by the upload IPC handler and the CLI bridge. `filePath` must
+  // already have passed resolveAllowedAudioPath (or approveAudioPath).
+  async transcribeLocalFile(filePath, options = {}) {
+    const audioBuffer = fs.readFileSync(filePath);
+    if (isSherpaLocalProvider(options.provider)) {
+      return this.parakeetManager.transcribeLocalParakeet(audioBuffer, options);
+    }
+    return this.whisperManager.transcribeLocalWhisper(audioBuffer, {
+      ...options,
+      ...this._resolveWhisperVadOptions("noteRecording"),
+    });
+  }
+
+  approveAudioPath(filePath) {
+    approveAudioPath(filePath);
+  }
+
+  listLocalTranscriptionModels() {
+    return listLocalTranscriptionModels({
+      whisperManager: this.whisperManager,
+      parakeetManager: this.parakeetManager,
+    });
+  }
+
   _resolveWhisperVadOptions(context) {
     const settings = this._getWhisperVadSettings();
     const {
@@ -753,46 +1069,10 @@ class IPCHandlers {
     };
   }
 
-  _asyncVectorUpsert(note) {
-    setImmediate(() => {
-      const vectorIndex = require("./vectorIndex");
-      if (!vectorIndex.isReady()) return;
-      const { LocalEmbeddings } = require("./localEmbeddings");
-      const text = LocalEmbeddings.noteEmbedText(note.title, note.content, note.enhanced_content);
-      vectorIndex
-        .upsertNote(note.id, text, { space_id: note.space_id, folder_id: note.folder_id ?? null })
-        .catch(() => {});
-    });
-  }
-
-  _asyncVectorDelete(noteId) {
-    setImmediate(() => {
-      const vectorIndex = require("./vectorIndex");
-      if (!vectorIndex.isReady()) return;
-      vectorIndex.deleteNote(noteId).catch(() => {});
-    });
-  }
-
-  // Space vector purges are persisted (pending_vector_purges) so a purge that
-  // lands while Qdrant is booting or down is retried once the index is ready.
-  drainPendingVectorPurges() {
-    setImmediate(() => {
-      void (async () => {
-        const vectorIndex = require("./vectorIndex");
-        if (!vectorIndex.isReady()) return;
-        for (const { space_id } of this.databaseManager.getPendingVectorPurges()) {
-          if (await vectorIndex.deleteBySpace(space_id)) {
-            this.databaseManager.clearPendingVectorPurge(space_id);
-          }
-        }
-      })().catch((error) => {
-        debugLogger.error(
-          "Pending vector purge drain failed",
-          { error: error?.message || String(error) },
-          "semantic-search"
-        );
-      });
-    });
+  // Note writes are journaled by SQLite triggers (pending_vector_changes); this
+  // only wakes an active semantic index to drain them.
+  notifyVectorChanges() {
+    this.getSemanticSearch?.()?.notifyChanges();
   }
 
   _mirrorDeleteFolderIfUnshared(folderName) {
@@ -1125,19 +1405,64 @@ class IPCHandlers {
     return resolveFailedGpuBackends(process.env.WHISPER_GPU_FAILED);
   }
 
-  _recordWhisperGpuFailure(backend) {
+  _attachWhisperServerListeners(serverManager) {
+    serverManager.on("cuda-fallback", ({ reason }) => {
+      this._recordWhisperGpuFailure("cuda", reason);
+      broadcastToWindows("cuda-fallback-notification", {});
+    });
+    serverManager.on("gpu-fallback", ({ reason }) => {
+      this._recordWhisperGpuFailure("vulkan", reason);
+      broadcastToWindows("gpu-fallback-notification", {});
+    });
+    // Persist the discrete-GPU pin so later launches spawn pinned directly
+    // instead of paying a second Vulkan cold start. See #1606.
+    serverManager.on("vulkan-device-pinned", ({ index }) => {
+      this._syncStartupEnv({ WHISPER_VULKAN_DEVICE: String(index) });
+    });
+    serverManager.on("vulkan-device-pin-cleared", () => {
+      this._syncStartupEnv({}, ["WHISPER_VULKAN_DEVICE"]);
+    });
+  }
+
+  // Remember the failed backend, and the error line that explains it, so the
+  // backend isn't re-attempted (and its model reload re-paid) on every launch
+  // and the settings card can say why (#1736). Cleared by retry, re-download,
+  // delete, and the once-per-upgrade reset. The reason is written in the same
+  // .env write as the flag. A failure with no readable reason clears the older
+  // one, so a stale cause is never shown.
+  _recordWhisperGpuFailure(backend, reason) {
     const failed = this._whisperGpuFailedBackends();
     if (!failed.includes(backend)) failed.push(backend);
-    this._syncStartupEnv({ WHISPER_GPU_FAILED: failed.join(",") });
+    const reasonKey = WHISPER_GPU_FAILURE_REASON_KEYS[backend];
+    this._syncStartupEnv(
+      { WHISPER_GPU_FAILED: failed.join(","), ...(reason ? { [reasonKey]: reason } : {}) },
+      reason ? [] : [reasonKey]
+    );
   }
 
   _clearWhisperGpuFailure(backend) {
     const failed = this._whisperGpuFailedBackends().filter((b) => b !== backend);
+    const reasonKey = WHISPER_GPU_FAILURE_REASON_KEYS[backend];
     if (failed.length > 0) {
-      this._syncStartupEnv({ WHISPER_GPU_FAILED: failed.join(",") });
+      this._syncStartupEnv({ WHISPER_GPU_FAILED: failed.join(",") }, [reasonKey]);
     } else {
-      this._syncStartupEnv({}, ["WHISPER_GPU_FAILED"]);
+      this._syncStartupEnv({}, ["WHISPER_GPU_FAILED", reasonKey]);
     }
+  }
+
+  // The control panel shows the GPU pack notice. An app started to the tray
+  // creates none, so there the dictation panel shows it instead (#2554).
+  _gpuPackNoticeWindow() {
+    const { controlPanelWindow, mainWindow, startedMinimized } = this.windowManager;
+    if (controlPanelWindow && !controlPanelWindow.isDestroyed()) return controlPanelWindow;
+    if (startedMinimized && mainWindow && !mainWindow.isDestroyed()) return mainWindow;
+    return null;
+  }
+
+  _whisperGpuFailureStatus(backend) {
+    const gpuFailed = this._whisperGpuFailedBackends().includes(backend);
+    const reason = gpuFailed ? process.env[WHISPER_GPU_FAILURE_REASON_KEYS[backend]] : null;
+    return { gpuFailed, gpuFailReason: reason || null };
   }
 
   // Captured before a handler stops the server to touch pack files (stopServer
@@ -1156,6 +1481,11 @@ class IPCHandlers {
     this.whisperManager.restartServerWithGpuPreference(modelName).catch((err) => {
       debugLogger.error("whisper-server GPU preference restart failed", { error: err.message });
     });
+    // Every pack download or delete and every Retry ends here, already saved.
+    // Tell every window, not just the caller's: Retry on the fallback pop-up
+    // runs in the dictation window, and Settings keeps up to three GPU cards
+    // mounted (#1736). A fallback is announced by its own notification.
+    broadcastToWindows("whisper-gpu-status-changed");
     return !!modelName;
   }
 
@@ -1211,6 +1541,22 @@ class IPCHandlers {
       this.windowManager.setOnboardingWindowMode(mode)
     );
 
+    ipcMain.handle("permission-guide-open", (event, state) =>
+      this.windowManager.permissionGuide.open(event, state)
+    );
+    ipcMain.handle("permission-guide-close", (event) =>
+      this.windowManager.permissionGuide.closeFromOwner(event)
+    );
+    ipcMain.handle("permission-guide-state", (event) =>
+      this.windowManager.permissionGuide.stateFor(event)
+    );
+    ipcMain.on("permission-guide-action", (event, action) =>
+      this.windowManager.permissionGuide.handleAction(event, action)
+    );
+    ipcMain.on("permission-guide-drag", (event, target) =>
+      this.windowManager.permissionGuide.startDrag(event, target)
+    );
+
     // WindowManager owns every teardown path for a demo (id-matched end,
     // onboarding-set-active(false), control panel closed); without this hook a
     // renderer crash mid-demo would leave the session set and broadcast every
@@ -1221,7 +1567,14 @@ class IPCHandlers {
 
     ipcMain.handle("onboarding-set-active", (_event, active) => {
       if (typeof active !== "boolean") return false;
-      return this.windowManager.setOnboardingActive(active);
+      const result = this.windowManager.setOnboardingActive(active);
+      // The dictation panel can show the GPU pack notice only once the normal
+      // app is up: until then it stays hidden.
+      const noticeWindow = this._gpuPackNoticeWindow();
+      if (!active && noticeWindow && noticeWindow === this.windowManager.mainWindow) {
+        noticeWindow.webContents.send("gpu-pack-migration-notice-ready");
+      }
+      return result;
     });
 
     ipcMain.handle("onboarding-demo-begin", (_event, session) => {
@@ -1257,17 +1610,21 @@ class IPCHandlers {
     ipcMain.handle("onboarding-demo-publish", (_event, event) => {
       const session = this._onboardingDemoSession;
       if (!session || !event || event.kind !== session.kind) return false;
-      if (!["listening", "processing", "partial", "success", "error"].includes(event.status)) {
-        return false;
-      }
+      if (!ONBOARDING_DEMO_STATUSES.has(event.status)) return false;
       const text = typeof event.text === "string" ? event.text.slice(0, 20000) : undefined;
       const message = typeof event.message === "string" ? event.message.slice(0, 500) : undefined;
+      const tool = typeof event.tool === "string" ? event.tool.slice(0, 64) : undefined;
+      const level = Number.isFinite(event.level)
+        ? Math.min(1, Math.max(0, event.level))
+        : undefined;
       broadcastToWindows("onboarding-demo-event", {
         demoId: session.id,
         kind: session.kind,
         status: event.status,
         text,
         message,
+        tool,
+        level,
       });
       return true;
     });
@@ -1368,9 +1725,18 @@ class IPCHandlers {
       this.windowManager.showDictationPanel({ reposition: true });
     });
 
+    ipcMain.handle("open-settings-section", async (_event, section) => {
+      if (!isProviderSettingsTarget(section)) return { success: false };
+      await this.windowManager.openSettings(section);
+      return { success: true };
+    });
+
     ipcMain.handle("capture-dictation-target", async () => {
+      // Recording start awaits this handler, so the Linux/Windows window probe
+      // runs in the background: a stalled AT-SPI peer would otherwise hold the
+      // microphone for seconds (#1944). Its consumers wait for it themselves.
+      void this.selectionManager?.captureTarget?.();
       const pid = (await this.textEditMonitor?.captureTargetPid?.()) ?? null;
-      await this.selectionManager?.captureTarget?.();
       return { success: true, pid };
     });
 
@@ -1384,6 +1750,11 @@ class IPCHandlers {
     ipcMain.handle("set-main-window-interactivity", (event, shouldCapture) => {
       this.windowManager.setMainWindowInteractivity(Boolean(shouldCapture));
       return { success: true };
+    });
+
+    ipcMain.handle("set-main-window-input-region", (event, region) => {
+      if (event.sender !== this.windowManager.mainWindow?.webContents) return null;
+      return this.windowManager.setMainWindowInputRegion(region);
     });
 
     ipcMain.handle("get-main-window-horizontal-direction", () => {
@@ -1407,9 +1778,28 @@ class IPCHandlers {
       return this.windowManager.resizeDictationErrorWindowToContent(surfaceHeight);
     });
 
+    // Counts changes to any key in Settings. A streaming socket keeps the count it
+    // was opened under, so a start never reuses one authenticated before a change.
+    let credentialGeneration = 0;
+    const saveSecretKey = (getter, saver, storeKey) => (event, key) => {
+      if (typeof key !== "string") throw new TypeError("API key must be a string");
+      // Committing an unedited key field saves the same value again.
+      const changed = this.environmentManager[getter]() !== key;
+      const result = this.environmentManager[saver](key);
+      if (!changed) return result;
+      credentialGeneration += 1;
+      // Notify peers by setting name only; leave the editor's pending input alone.
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed() && win.webContents.id !== event.sender.id) {
+          win.webContents.send("api-key-updated", storeKey);
+        }
+      }
+      return result;
+    };
+
     for (const k of BYOK_API_KEYS) {
       ipcMain.handle(`get-${k.base}-key`, () => this.environmentManager[k.get]());
-      ipcMain.handle(`save-${k.base}-key`, (event, key) => this.environmentManager[k.save](key));
+      ipcMain.handle(`save-${k.base}-key`, saveSecretKey(k.get, k.save, k.storeKey));
     }
 
     ipcMain.handle("db-save-transcription", async (event, text, rawText, options) => {
@@ -1427,6 +1817,9 @@ class IPCHandlers {
     });
 
     ipcMain.handle("analytics-record-event", async (_event, input) => {
+      // The renderer only warns when this write fails, then saves the
+      // transcription as completed anyway -- leaving a row the backfill is
+      // the only thing that will ever reconcile.
       const result = this.databaseManager.recordAnalyticsEvent(input);
       // Dictation and the control panel are separate renderers, so the
       // Insights view can only learn about a new event through the main process.
@@ -1439,52 +1832,71 @@ class IPCHandlers {
     });
 
     ipcMain.handle("analytics-get-summary", async () => {
+      await this._ensureAnalyticsHistoryBackfilled();
       return this.databaseManager.getAnalyticsSummary();
     });
 
-    ipcMain.handle("analytics-get-pending", async (_event, limit) => {
-      return this.databaseManager.getPendingAnalyticsEvents(limit);
+    ipcMain.handle("analytics-get-pending", async (_event, limit, context) => {
+      const accountId = assertAnalyticsSyncContext(context);
+      await this._ensureAnalyticsHistoryBackfilled();
+      return this.databaseManager.getPendingAnalyticsEvents(limit, accountId);
     });
 
-    ipcMain.handle("analytics-mark-synced", async (_event, eventIds) => {
-      return this.databaseManager.markAnalyticsEventsSynced(eventIds);
+    ipcMain.handle("analytics-mark-synced", async (_event, eventIds, context) => {
+      const accountId = assertAnalyticsSyncContext(context);
+      return this.databaseManager.markAnalyticsEventsSynced(eventIds, accountId);
     });
 
-    ipcMain.handle("analytics-get-pending-deletes", async (_event, limit) => {
-      return this.databaseManager.getPendingAnalyticsDeletes(limit);
+    ipcMain.handle("analytics-get-pending-deletes", async (_event, limit, context) => {
+      const accountId = assertAnalyticsSyncContext(context);
+      return this.databaseManager.getPendingAnalyticsDeletes(limit, accountId);
     });
 
-    ipcMain.handle("analytics-hard-delete", async (_event, eventIds) => {
-      return this.databaseManager.hardDeleteAnalyticsEvents(eventIds);
+    ipcMain.handle("analytics-hard-delete", async (_event, eventIds, context) => {
+      const accountId = assertAnalyticsSyncContext(context);
+      return this.databaseManager.hardDeleteAnalyticsEvents(eventIds, accountId);
     });
 
-    ipcMain.handle("analytics-get-pending-clear", async () => {
-      return this.databaseManager.getPendingAnalyticsClear();
+    ipcMain.handle("analytics-get-pending-clear", async (_event, context) => {
+      const accountId = assertAnalyticsSyncContext(context);
+      return this.databaseManager.getPendingAnalyticsClear(accountId);
     });
 
-    ipcMain.handle("analytics-complete-clear", async (_event, clearedThrough) => {
-      return this.databaseManager.completeAnalyticsClear(clearedThrough);
+    ipcMain.handle("analytics-complete-clear", async (_event, clearedThrough, context) => {
+      const accountId = assertAnalyticsSyncContext(context);
+      return this.databaseManager.completeAnalyticsClear(clearedThrough, accountId);
     });
 
-    ipcMain.handle("analytics-count-unclaimed", async () => {
+    ipcMain.handle("analytics-count-unclaimed", async (_event, context) => {
+      assertAnalyticsSyncContext(context);
+      await this._ensureAnalyticsHistoryBackfilled();
       return this.databaseManager.countUnclaimedAnalyticsEvents();
     });
 
-    ipcMain.handle("analytics-count-awaiting-upload", async () => {
-      return this.databaseManager.countAnalyticsEventsAwaitingUpload();
+    ipcMain.handle("analytics-count-awaiting-upload", async (_event, context) => {
+      const accountId = assertAnalyticsSyncContext(context);
+      await this._ensureAnalyticsHistoryBackfilled();
+      return this.databaseManager.countAnalyticsEventsAwaitingUpload(accountId);
     });
 
-    ipcMain.handle("analytics-claim-anonymous", async () => {
-      const result = this.databaseManager.claimAnonymousAnalyticsEvents();
-      // Claimed rows are only pushed by the Insights view's reload, and the
-      // claim itself changes nothing it renders, so tell it to reload.
-      if (result?.claimed > 0) {
-        setImmediate(() => {
-          broadcastToWindows("analytics-changed");
-        });
+    ipcMain.handle(
+      "analytics-claim-anonymous",
+      async (_event, accountId, expectedAuthGeneration) => {
+        const state = tokenStore.getState();
+        if (!state.token || state.generation !== expectedAuthGeneration) {
+          return { success: false, claimed: 0, code: "AUTH_CONTEXT_CHANGED" };
+        }
+        const result = this.databaseManager.claimAnonymousAnalyticsEvents(accountId);
+        // Claimed rows are only pushed by the Insights view's reload, and the
+        // claim itself changes nothing it renders, so tell it to reload.
+        if (result?.claimed > 0) {
+          setImmediate(() => {
+            broadcastToWindows("analytics-changed");
+          });
+        }
+        return result;
       }
-      return result;
-    });
+    );
 
     ipcMain.handle("db-clear-transcriptions", async (event) => {
       this.audioStorageManager.deleteAllAudio();
@@ -1591,6 +2003,10 @@ class IPCHandlers {
           this._retentionSettings = settings;
           this._retentionSettingsSynced = true;
           this._runRetentionCleanup();
+          // First point at which the local-history switch is known to be real.
+          // After the sweep, so expired transcripts are gone before they can be
+          // reconstructed into counters the sweep would only have to purge.
+          void this._ensureAnalyticsHistoryBackfilled();
         },
       })
     );
@@ -1843,7 +2259,7 @@ class IPCHandlers {
         );
         if (result?.success && result?.note) {
           setImmediate(() => broadcastToWindows("note-added", result.note));
-          this._asyncVectorUpsert(result.note);
+          this.notifyVectorChanges();
           this._asyncMirrorWrite(result.note);
         }
         return result;
@@ -1862,11 +2278,28 @@ class IPCHandlers {
       return this.databaseManager.getNotesForSpace(spaceId, limit);
     });
 
-    ipcMain.handle("db-update-note", async (event, id, updates) => {
-      const result = this.databaseManager.updateNote(id, updates);
+    ipcMain.handle("db-get-note-undos", () => this.databaseManager.getNoteUndos());
+    ipcMain.handle("db-claim-note-undo", (_event, token) =>
+      this.databaseManager.claimNoteUndo(token)
+    );
+    ipcMain.handle("db-discard-note-undo", (_event, id, token) =>
+      this.databaseManager.discardNoteUndo(id, token)
+    );
+    ipcMain.handle("db-undo-note-update", (_event, token) => {
+      const result = this.databaseManager.undoNoteUpdate(token);
       if (result?.success && result?.note) {
         setImmediate(() => broadcastToWindows("note-updated", result.note));
-        this._asyncVectorUpsert(result.note);
+        this.notifyVectorChanges();
+        this._asyncMirrorWrite(result.note);
+      }
+      return result;
+    });
+
+    ipcMain.handle("db-update-note", async (event, id, updates, options) => {
+      const result = this.databaseManager.updateNote(id, updates, options);
+      if (result?.success && result?.note) {
+        setImmediate(() => broadcastToWindows("note-updated", result.note));
+        this.notifyVectorChanges();
         this._asyncMirrorWrite(result.note);
         if (updates.participants) {
           this._tryAutoLabelOneOnOne(id);
@@ -1887,11 +2320,6 @@ class IPCHandlers {
     ipcMain.handle(
       "db-semantic-search-notes",
       async (event, query, limit = 5, spaceId, folderId) => {
-        const vectorIndex = require("./vectorIndex");
-        if (!vectorIndex.isReady()) {
-          return this.databaseManager.searchNotes(query, limit, spaceId, folderId);
-        }
-
         try {
           // Qdrant payload updates are best-effort. Use its space filter to
           // reduce the candidate set, then validate every scoped vector hit
@@ -1903,8 +2331,9 @@ class IPCHandlers {
               : undefined;
           const [ftsResults, vectorResults] = await Promise.all([
             this.databaseManager.searchNotes(query, overFetch, spaceId, folderId),
-            vectorIndex.search(query, overFetch, vectorFilter),
+            this.getSemanticSearch?.()?.search(query, overFetch, vectorFilter),
           ]);
+          if (vectorResults == null) return ftsResults.slice(0, limit);
           const scopedIds = new Set(
             this.databaseManager.getNoteIdsInScope(
               spaceId,
@@ -1951,20 +2380,6 @@ class IPCHandlers {
       }
     );
 
-    ipcMain.handle("db-semantic-reindex-all", async () => {
-      const vectorIndex = require("./vectorIndex");
-      if (!vectorIndex.isReady()) return { success: false, error: "Vector index not ready" };
-
-      const notes = this.databaseManager.getNotes(null, 100000);
-      let done = 0;
-      const { failed } = await vectorIndex.reindexAll(notes, (completed, total) => {
-        done = completed;
-        broadcastToWindows("semantic-reindex-progress", { done: completed, total });
-      });
-      // Report failed batches so callers only latch their done-flag on a clean pass.
-      return { success: failed === 0, indexed: done - failed };
-    });
-
     ipcMain.handle("db-update-note-cloud-id", async (event, id, cloudId) => {
       return this.databaseManager.updateNoteCloudId(id, cloudId);
     });
@@ -1981,27 +2396,15 @@ class IPCHandlers {
       return this.databaseManager.getFolders(spaceId);
     });
 
-    ipcMain.handle("db-create-folder", async (event, name, spaceId) => {
-      const result = this.databaseManager.createFolder(name, spaceId);
-      if (result?.success && result?.folder) {
-        setImmediate(() => {
-          broadcastToWindows("folder-created", result.folder);
-          if (this._noteFilesEnabled) {
-            const markdownMirror = require("./markdownMirror");
-            markdownMirror.ensureFolder(result.folder.name);
-          }
-        });
-      }
-      return result;
-    });
+    ipcMain.handle("db-create-folder", (_event, name, spaceId) =>
+      this.createFolderWithEffects(name, spaceId)
+    );
 
     ipcMain.handle("db-delete-folder", async (event, id) => {
       const folderName = this._noteFilesEnabled ? this._getFolderName(id) : null;
       const result = this.databaseManager.deleteFolder(id);
       if (result?.success) {
-        for (const noteId of result.noteIds ?? []) {
-          this._asyncVectorDelete(noteId);
-        }
+        this.notifyVectorChanges();
         // Other accounts' notes were released to the space root; their mirror
         // files leave with the folder directory, so rewrite the live ones.
         for (const note of result.relocatedNotes ?? []) {
@@ -2033,10 +2436,8 @@ class IPCHandlers {
     ipcMain.handle("db-move-folder-to-space", async (event, id, spaceId) => {
       const result = this.databaseManager.moveFolderToSpace(id, spaceId);
       if (result?.success) {
-        // Qdrant payloads carry space_id — refresh the moved notes' vectors.
-        for (const note of result.notes ?? []) {
-          this._asyncVectorUpsert(note);
-        }
+        // Qdrant payloads carry space_id — the triggers journaled the moved notes.
+        this.notifyVectorChanges();
         if (result.folder) {
           setImmediate(() => broadcastToWindows("folder-synced", result.folder));
         }
@@ -2070,6 +2471,16 @@ class IPCHandlers {
               : "Authentication context changed before account scoping",
         };
       }
+      const previousScope = accountScopeBinding.resolveActiveAccountScope({
+        ...state,
+        binding: accountScopeBinding.read(),
+      });
+      if (
+        this.databaseManager.activeAccountId !== accountId ||
+        (accountId !== null && previousScope?.accountId !== accountId)
+      ) {
+        this.windowManager.retireMeetingNotificationScope();
+      }
       this.databaseManager.setActiveAccountId(accountId);
       if (accountId !== null) accountScopeBinding.persist(accountId, state.token);
       else accountScopeBinding.clear();
@@ -2077,6 +2488,9 @@ class IPCHandlers {
         "active-account-scope-changed",
         accountId !== null ? { accountId, authGeneration: state.generation } : null
       );
+      this.connectorManager?.accountChanged();
+      void this.connectorManager?.notifyStatusChanged();
+      void this.metaActivation?.flush();
       return { success: true };
     });
 
@@ -2087,31 +2501,42 @@ class IPCHandlers {
       })
     );
 
-    ipcMain.handle("delete-account-data", async (_event, accountId, expectedGeneration) => {
-      const state = tokenStore.getState();
-      if (
-        typeof accountId !== "string" ||
-        accountId.trim().length === 0 ||
-        !state.token ||
-        state.generation !== expectedGeneration
-      ) {
-        return {
-          success: false,
-          code: "AUTH_CONTEXT_CHANGED",
-          error: "Authentication context changed before local account cleanup",
-        };
-      }
-      try {
-        const result = this.databaseManager.deleteAccountData(accountId);
-        for (const noteId of result.deletedNoteIds) {
-          this._asyncVectorDelete(noteId);
-          this._asyncMirrorDelete(noteId);
+    ipcMain.handle(
+      "delete-account-data",
+      async (_event, accountId, expectedGeneration, options) => {
+        const state = tokenStore.getState();
+        if (
+          typeof accountId !== "string" ||
+          accountId.trim().length === 0 ||
+          !state.token ||
+          state.generation !== expectedGeneration
+        ) {
+          return {
+            success: false,
+            code: "AUTH_CONTEXT_CHANGED",
+            error: "Authentication context changed before local account cleanup",
+          };
         }
-        return { success: true, ...result };
-      } catch (error) {
-        return { success: false, code: "LOCAL_ACCOUNT_CLEANUP_FAILED", error: error.message };
+        try {
+          // Best effort; each revoke has a 5s deadline (connectorManager.js).
+          // Erasing the device takes the calendar logins with it, so a grant
+          // Gmail shares with a calendar is revoked too: cleanup-app runs
+          // after this and finds no Gmail login left to revoke.
+          await this.connectorManager?.disconnectAll({
+            erasingDevice: options?.erasingDevice === true,
+          });
+          const result = this.databaseManager.deleteAccountData(accountId);
+          this.metaActivation?.purge(accountId);
+          this.notifyVectorChanges();
+          for (const noteId of result.deletedNoteIds) {
+            this._asyncMirrorDelete(noteId);
+          }
+          return { success: true, ...result };
+        } catch (error) {
+          return { success: false, code: "LOCAL_ACCOUNT_CLEANUP_FAILED", error: error.message };
+        }
       }
-    });
+    );
 
     ipcMain.handle("db-update-space", async (event, id, updates) => {
       const result = this.databaseManager.updateSpace(id, updates);
@@ -2135,10 +2560,10 @@ class IPCHandlers {
       const result = this.databaseManager.purgeSpace(id, options);
       if (result?.success) {
         if (!result.preservedForOtherAccounts) {
+          // The purge row and the relocated notes' trigger rows drain together.
           this.databaseManager.addPendingVectorPurge(result.spaceId);
-          this.drainPendingVectorPurges();
+          this.notifyVectorChanges();
           for (const note of result.relocatedNotes ?? []) {
-            this._asyncVectorUpsert(note);
             this._asyncMirrorWrite(note);
           }
           for (const noteId of result.noteIds ?? []) {
@@ -2163,8 +2588,8 @@ class IPCHandlers {
       return this.databaseManager.getAction(id);
     });
 
-    ipcMain.handle("db-create-action", async (event, name, description, prompt, icon) => {
-      const result = this.databaseManager.createAction(name, description, prompt, icon);
+    ipcMain.handle("db-create-action", async (event, name, description, prompt, icon, fields) => {
+      const result = this.databaseManager.createAction(name, description, prompt, icon, fields);
       if (result?.success && result?.action) {
         setImmediate(() => {
           broadcastToWindows("action-created", result.action);
@@ -2321,38 +2746,56 @@ class IPCHandlers {
       const note = this.databaseManager.upsertNoteFromCloud(cloudNote, localFolderId, localSpaceId);
       if (note) {
         setImmediate(() => broadcastToWindows("note-synced", note));
-        this._asyncVectorUpsert(note);
+        this.notifyVectorChanges();
       }
       return note;
     });
     ipcMain.handle(
       "db-acknowledge-note-create",
-      (_, id, snapshot, cloudId, cloudUpdatedAt, ownerUserId, settleIfUnchanged) =>
-        this.databaseManager.acknowledgeNoteCreate(
+      (_, id, snapshot, cloudId, cloudUpdatedAt, ownerUserId, options) => {
+        const result = this.databaseManager.acknowledgeNoteCreate(
           id,
           snapshot,
           cloudId,
           cloudUpdatedAt,
           ownerUserId,
-          settleIfUnchanged
-        )
+          options
+        );
+        if (result.note) {
+          setImmediate(() => broadcastToWindows("note-synced", result.note));
+          this.notifyVectorChanges();
+        }
+        return result;
+      }
     );
     ipcMain.handle(
       "db-mark-note-synced-if-unchanged",
-      (_, id, snapshot, expectedCloudId, cloudUpdatedAt, ownerUserId) =>
-        this.databaseManager.markNoteSyncedIfUnchanged(
+      (_, id, snapshot, expectedCloudId, cloudUpdatedAt, ownerUserId, cloudRevision, cloudNote) => {
+        const result = this.databaseManager.markNoteSyncedIfUnchanged(
           id,
           snapshot,
           expectedCloudId,
           cloudUpdatedAt,
-          ownerUserId
-        )
+          ownerUserId,
+          cloudRevision,
+          cloudNote
+        );
+        // The ack took the server's copy of a field: refresh open editors.
+        if (result.note) {
+          setImmediate(() => broadcastToWindows("note-synced", result.note));
+          this.notifyVectorChanges();
+        }
+        return result;
+      }
     );
-    ipcMain.handle("db-set-note-cloud-base", (_, id, cloudUpdatedAt) =>
-      this.databaseManager.setNoteCloudBase(id, cloudUpdatedAt)
+    ipcMain.handle("db-set-note-cloud-base", (_, id, cloudUpdatedAt, cloudRevision, options) =>
+      this.databaseManager.setNoteCloudBase(id, cloudUpdatedAt, cloudRevision, options)
     );
     ipcMain.handle("db-set-note-owner-from-cloud", (_, id, ownerUserId) =>
       this.databaseManager.setNoteOwnerFromCloud(id, ownerUserId)
+    );
+    ipcMain.handle("db-count-notes-missing-revision", (_, spaceKind) =>
+      this.databaseManager.countNotesMissingRevision(spaceKind)
     );
     ipcMain.handle("db-count-team-notes-missing-owner", () =>
       this.databaseManager.countTeamNotesMissingOwner()
@@ -2366,7 +2809,7 @@ class IPCHandlers {
     ipcMain.handle("db-hard-delete-note", (_, id) => {
       const result = this.databaseManager.hardDeleteNote(id);
       if (result?.success) {
-        this._asyncVectorDelete(id);
+        this.notifyVectorChanges();
         this._asyncMirrorDelete(id);
         setImmediate(() => broadcastToWindows("note-deleted", { id }));
       }
@@ -2407,8 +2850,8 @@ class IPCHandlers {
     ipcMain.handle("db-restore-folder-after-denied-delete", (_, id) => {
       const result = this.databaseManager.restoreFolderAfterDeniedDelete(id);
       if (result?.success) {
+        this.notifyVectorChanges();
         for (const note of result.notes ?? []) {
-          this._asyncVectorUpsert(note);
           this._asyncMirrorWrite(note);
         }
         setImmediate(() => {
@@ -2423,9 +2866,7 @@ class IPCHandlers {
     ipcMain.handle("db-hard-delete-folder", (_, id) => {
       const result = this.databaseManager.hardDeleteFolder(id);
       if (result?.success) {
-        for (const noteId of result.noteIds ?? []) {
-          this._asyncVectorDelete(noteId);
-        }
+        this.notifyVectorChanges();
         // Other accounts' notes were released to the space root; their mirror
         // files leave with the folder directory, so rewrite the live ones.
         for (const note of result.relocatedNotes ?? []) {
@@ -2441,14 +2882,13 @@ class IPCHandlers {
     ipcMain.handle("db-relocate-revoked-folder", (_, id, privateSpaceId, preserveFolder) => {
       const result = this.databaseManager.relocateRevokedFolder(id, privateSpaceId, preserveFolder);
       if (result?.success) {
-        // Qdrant payloads carry space_id and the markdown mirror files by
-        // folder — refresh relocated notes, drop the server-owned ones.
+        // The triggers journaled the relocated and deleted notes. Mirror files live by
+        // folder, so rewrite the relocated notes and drop the server-owned ones.
+        this.notifyVectorChanges();
         for (const note of result.relocatedNotes ?? []) {
-          this._asyncVectorUpsert(note);
           this._asyncMirrorWrite(note);
         }
         for (const noteId of result.deletedNoteIds ?? []) {
-          this._asyncVectorDelete(noteId);
           this._asyncMirrorDelete(noteId);
         }
         setImmediate(() => {
@@ -2525,9 +2965,9 @@ class IPCHandlers {
     ipcMain.handle("db-get-transcription-by-client-id", (_, clientId) =>
       this.databaseManager.getTranscriptionByClientId(clientId)
     );
-    ipcMain.handle("db-upsert-transcription-from-cloud", (_, cloudTranscription) =>
-      this.databaseManager.upsertTranscriptionFromCloud(cloudTranscription)
-    );
+    ipcMain.handle("db-upsert-transcription-from-cloud", (_, cloudTranscription) => {
+      return this.databaseManager.upsertTranscriptionFromCloud(cloudTranscription);
+    });
     ipcMain.handle("db-mark-transcription-synced", (_, id, cloudId) =>
       this.databaseManager.markTranscriptionSynced(id, cloudId)
     );
@@ -2549,28 +2989,23 @@ class IPCHandlers {
 
         const { dialog } = require("electron");
         const fs = require("fs");
-        const ext = format === "txt" ? "txt" : "md";
+        const exportFormat =
+          format === "txt"
+            ? { name: "Text", extension: "txt" }
+            : { name: "Markdown", extension: "md" };
         const safeName = (note.title || "Untitled").replace(/[/\\?%*:|"<>]/g, "-");
 
         const result = await dialog.showSaveDialog({
-          defaultPath: `${safeName}.${ext}`,
-          filters: [
-            { name: "Markdown", extensions: ["md"] },
-            { name: "Text", extensions: ["txt"] },
-          ],
+          defaultPath: `${safeName}.${exportFormat.extension}`,
+          filters: [{ name: exportFormat.name, extensions: [exportFormat.extension] }],
         });
 
         if (result.canceled || !result.filePath) return { success: false };
 
         let exportContent;
         if (format === "txt") {
-          exportContent = (note.content || "")
-            .replace(/#{1,6}\s+/g, "")
-            .replace(/[*_~`]+/g, "")
-            .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-            .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
-            .replace(/^>\s+/gm, "")
-            .trim();
+          const { markdownToPlainText } = await import("./markdownToPlainText.ts");
+          exportContent = markdownToPlainText(note.content || "");
         } else {
           exportContent = note.enhanced_content || note.content;
         }
@@ -2595,18 +3030,18 @@ class IPCHandlers {
 
         const { dialog } = require("electron");
         const fs = require("fs");
-        const extMap = { srt: "srt", json: "json", md: "md" };
-        const ext = extMap[format] || "txt";
+        const exportFormats = {
+          txt: { name: "Text", extension: "txt" },
+          srt: { name: "SubRip Subtitles", extension: "srt" },
+          json: { name: "JSON", extension: "json" },
+          md: { name: "Markdown", extension: "md" },
+        };
+        const exportFormat = exportFormats[format] || exportFormats.txt;
         const safeName = (note.title || "Untitled").replace(/[/\\?%*:|"<>]/g, "-");
 
         const result = await dialog.showSaveDialog({
-          defaultPath: `${safeName}.${ext}`,
-          filters: [
-            { name: "Text", extensions: ["txt"] },
-            { name: "SubRip Subtitles", extensions: ["srt"] },
-            { name: "JSON", extensions: ["json"] },
-            { name: "Markdown", extensions: ["md"] },
-          ],
+          defaultPath: `${safeName}.${exportFormat.extension}`,
+          filters: [{ name: exportFormat.name, extensions: [exportFormat.extension] }],
         });
 
         if (result.canceled || !result.filePath) return { success: false };
@@ -2657,12 +3092,7 @@ class IPCHandlers {
       if (options.multiple === true) properties.push("multiSelections");
       const result = await dialog.showOpenDialog({
         properties,
-        filters: [
-          {
-            name: "Audio Files",
-            extensions: ["mp3", "wav", "m4a", "webm", "ogg", "oga", "flac", "aac", "opus"],
-          },
-        ],
+        filters: [{ name: "Audio and Video Files", extensions: UPLOAD_AUDIO_EXTENSIONS }],
       });
       if (result.canceled || !result.filePaths.length) {
         return { canceled: true };
@@ -2775,7 +3205,6 @@ class IPCHandlers {
     });
 
     ipcMain.handle("transcribe-audio-file", async (event, filePath, options = {}) => {
-      const fs = require("fs");
       // Uploads pass a requestId so cancel-upload-transcription can abort the
       // local decode; flows without one (voice drafts) register nothing.
       const { signal, release } = this._uploadCancelRegistry.register(options.requestId);
@@ -2785,21 +3214,7 @@ class IPCHandlers {
         }
         const real = resolveAllowedAudioPath(filePath);
         if (!real) return { success: false, error: "File path not allowed" };
-        const audioBuffer = fs.readFileSync(real);
-        if (isSherpaLocalProvider(options.provider)) {
-          const result = await this.parakeetManager.transcribeLocalParakeet(audioBuffer, {
-            ...options,
-            signal,
-          });
-          return result;
-        }
-        const vadOptions = this._resolveWhisperVadOptions("noteRecording");
-        const result = await this.whisperManager.transcribeLocalWhisper(audioBuffer, {
-          ...options,
-          ...vadOptions,
-          signal,
-        });
-        return result;
+        return await this.transcribeLocalFile(real, { ...options, signal });
       } catch (error) {
         if (error?.name === "AbortError" || signal?.aborted) {
           debugLogger.debug("Local audio file transcription cancelled", {
@@ -2872,6 +3287,9 @@ class IPCHandlers {
           mainWindow.showInactive();
         } else {
           mainWindow.blur();
+          // On Linux blur() leaves X focus on the pill, where the assistant panel
+          // took it, so the paste would land in the panel.
+          if (process.platform === "linux") this.windowManager.returnLinuxKeyboardFocus();
           await new Promise((resolve) => setTimeout(resolve, 80));
         }
       }
@@ -2886,16 +3304,41 @@ class IPCHandlers {
       // paste lands in the field the user was dictating into, not wherever focus
       // drifted during transcription (#859). macOS handles this via
       // activateTargetPid above; Linux re-detects the target inside pasteLinux.
-      const targetWindow =
+      const winTarget =
         process.platform === "win32"
-          ? ((await this.selectionManager?.getWinTargetHwnd?.()) ?? null)
+          ? ((await this.selectionManager?.getWinTarget?.()) ?? null)
+          : null;
+      const targetWindow =
+        winTarget &&
+        isRestorablePasteTarget({
+          target: winTarget,
+          ownExeName: path.basename(process.execPath),
+          ownWindowHandles: BrowserWindow.getAllWindows()
+            .filter((win) => !win.isDestroyed())
+            .map((win) => win.getNativeWindowHandle()),
+        })
+          ? winTarget.id
           : null;
 
-      const pasteResult = await this.clipboardManager.pasteText(textToPaste, {
-        ...options,
-        webContents: event.sender,
-        targetWindow,
-      });
+      let pasteResult;
+      try {
+        pasteResult = await this.clipboardManager.pasteText(textToPaste, {
+          ...options,
+          webContents: event.sender,
+          targetWindow,
+          silentAccessibilityCheck: true,
+        });
+      } catch (error) {
+        if (error?.code !== "ACCESSIBILITY_PERMISSION_REQUIRED" || error.clipboardCopied !== true) {
+          throw error;
+        }
+        return {
+          success: false,
+          pasted: false,
+          code: "ACCESSIBILITY_PERMISSION_REQUIRED",
+          clipboardCopied: true,
+        };
+      }
       const pasted = pasteResult?.pasted !== false;
       debugLogger.debug("[AutoLearn] Paste completed", {
         autoLearnEnabled: this._autoLearnEnabled,
@@ -2920,8 +3363,13 @@ class IPCHandlers {
       // Promise cannot cross Electron's IPC boundary, though, and renderer
       // callers need to know whether text was pasted, but not the delayed
       // clipboard restoration promise. Successful platform paths predate the
-      // explicit `pasted` outcome; only the clipboard-only fallback sets false.
-      return { success: true, pasted };
+      // explicit `pasted` outcome; only the clipboard-only fallback and a held-back
+      // paste (held modifiers or a missing or failed wl-copy, which carries a `reason`) set false.
+      return {
+        success: true,
+        pasted,
+        ...(pasteResult?.reason ? { reason: pasteResult.reason } : {}),
+      };
     });
 
     ipcMain.handle("check-accessibility-permission", async (_event, silent = false) => {
@@ -2940,6 +3388,47 @@ class IPCHandlers {
 
     ipcMain.handle("write-clipboard", async (event, text) => {
       return this.clipboardManager.writeClipboard(text, event.sender);
+    });
+
+    ipcMain.handle("leaderboard-copy-image", async (_event, dataUrl) => {
+      try {
+        const { clipboard, nativeImage } = require("electron");
+        const image = nativeImage.createFromBuffer(decodeLeaderboardPngDataUrl(dataUrl));
+        if (image.isEmpty()) throw new Error("Leaderboard image could not be decoded");
+        clipboard.writeImage(image);
+        return { success: true };
+      } catch (error) {
+        debugLogger.error(
+          "Failed to copy leaderboard image",
+          { error: error.message },
+          "analytics"
+        );
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("leaderboard-save-image", async (event, dataUrl, suggestedName) => {
+      try {
+        const { dialog } = require("electron");
+        const parentWindow = BrowserWindow.fromWebContents(event.sender);
+        const options = {
+          defaultPath: leaderboardImageFilename(suggestedName),
+          filters: [{ name: "PNG image", extensions: ["png"] }],
+        };
+        const result = parentWindow
+          ? await dialog.showSaveDialog(parentWindow, options)
+          : await dialog.showSaveDialog(options);
+        if (result.canceled || !result.filePath) return { success: true, canceled: true };
+        await fs.promises.writeFile(result.filePath, decodeLeaderboardPngDataUrl(dataUrl));
+        return { success: true, canceled: false };
+      } catch (error) {
+        debugLogger.error(
+          "Failed to save leaderboard image",
+          { error: error.message },
+          "analytics"
+        );
+        return { success: false, error: error.message };
+      }
     });
 
     ipcMain.handle("check-paste-tools", async () => {
@@ -3214,14 +3703,16 @@ class IPCHandlers {
       const { detectNvidiaGpu } = require("../utils/gpuDetection");
       const gpuInfo = await detectNvidiaGpu();
       if (!this.whisperCudaManager) {
-        return { downloaded: false, downloading: false, path: null, gpuInfo };
+        return { downloaded: false, needsUpdate: false, downloading: false, path: null, gpuInfo };
       }
       return {
         downloaded: this.whisperCudaManager.isDownloaded(),
+        needsUpdate: this.whisperCudaManager.needsUpdate(),
         downloading: this.whisperCudaManager.isDownloading(),
         path: this.whisperCudaManager.getCudaBinaryPath(),
         gpuInfo,
-        gpuFailed: this._whisperGpuFailedBackends().includes("cuda"),
+        ...this._whisperGpuFailureStatus("cuda"),
+        inUse: this.whisperManager.resolveGpuPackInUse() === "cuda",
       };
     });
 
@@ -3280,10 +3771,12 @@ class IPCHandlers {
       const [vulkan, gpuInfo] = await Promise.all([detectVulkanGpu(), detectNvidiaGpu()]);
       return {
         downloaded: this.whisperVulkanManager?.isDownloaded() ?? false,
+        needsUpdate: this.whisperVulkanManager?.needsUpdate() ?? false,
         downloading: this.whisperVulkanManager?.isDownloading() ?? false,
         vulkan,
         hasNvidiaGpu: gpuInfo.hasNvidiaGpu,
-        gpuFailed: this._whisperGpuFailedBackends().includes("vulkan"),
+        ...this._whisperGpuFailureStatus("vulkan"),
+        inUse: this.whisperManager.resolveGpuPackInUse() === "vulkan",
       };
     });
 
@@ -3333,21 +3826,20 @@ class IPCHandlers {
       return { success: true, deletedCount };
     });
 
-    // One-time "GPU pack needs re-downloading" notice recorded by the
-    // legacy-layout migration before any window existed. See #1606.
-    ipcMain.handle("get-gpu-pack-migration-notice", () => {
-      return require("./gpuPackMigrationNotice").read();
-    });
-
-    ipcMain.handle("dismiss-gpu-pack-migration-notice", () => {
-      require("./gpuPackMigrationNotice").clear();
-      return { success: true };
+    // One-time "GPU pack needs re-downloading" notice recorded before any
+    // window existed (#1606). Only the window that shows it can take it.
+    ipcMain.handle("take-gpu-pack-migration-notice", (event) => {
+      if (event.sender !== this._gpuPackNoticeWindow()?.webContents) return null;
+      return require("./gpuPackMigrationNotice").take();
     });
 
     // Clears the remembered GPU failure and reloads the server with the GPU
     // backend re-enabled (Retry on the "GPU could not be activated" state)
     ipcMain.handle("whisper-gpu-retry", async () => {
-      this._syncStartupEnv({}, ["WHISPER_GPU_FAILED"]);
+      this._syncStartupEnv({}, [
+        "WHISPER_GPU_FAILED",
+        ...Object.values(WHISPER_GPU_FAILURE_REASON_KEYS),
+      ]);
       return {
         success: true,
         willRestart: this._applyWhisperGpuPreference(this._whisperReloadModel()),
@@ -3573,14 +4065,16 @@ class IPCHandlers {
         if (!realPath) return { success: false, error: "File path not allowed" };
         filePath = realPath;
 
-        const numSpeakers = Math.min(
-          MAX_SPEAKER_COUNT,
-          Math.max(-1, Math.round(Number(options.numSpeakers) || -1))
-        );
+        const maxSpeakers = normalizeStoredSpeakerCount(options.numSpeakers) ?? MAX_SPEAKER_COUNT;
 
         const { convertToWav } = require("./ffmpegUtils");
         const { getSafeTempDir } = require("./safeTempDir");
-        const { resolveClusterThreshold, dropNegligibleClusters } = require("./diarizationPolicy");
+        const {
+          resolveClusterThreshold,
+          dropNegligibleClusters,
+          isCollapsedDiarization,
+          capSpeakerClustersByVoice,
+        } = require("./diarizationPolicy");
         const { PCM16_MONO_16K_BYTES_PER_SECOND } = require("./transcriptionTimeout");
         const wavPath = path.join(getSafeTempDir(), `ow-diarize-${Date.now()}.wav`);
 
@@ -3594,22 +4088,48 @@ class IPCHandlers {
           const durationSeconds = fs.statSync(wavPath).size / PCM16_MONO_16K_BYTES_PER_SECOND;
           const threshold = resolveClusterThreshold(durationSeconds, options.threshold);
 
-          let segments = await this.diarizationManager.diarize(wavPath, {
-            numSpeakers,
-            threshold,
-            signal,
-          });
+          // Always auto-cluster: forcing 2 clusters on #2021's two-person call
+          // split short utterances from long ones instead of one speaker from
+          // the other, merging both speakers. The requested count is applied
+          // as a cap after cleanup instead.
+          let segments = await this.diarizationManager.diarize(wavPath, { threshold, signal });
           if (signal?.aborted) {
             return { success: false, error: "Cancelled", code: "UPLOAD_CANCELLED" };
+          }
+          // A collapsed run's labels are wrong either way: two people under
+          // one label, or one person split off into a phantom. With no
+          // segments the renderer keeps the plain transcript and shows the
+          // diarization warning instead. Judged before phantoms are dropped;
+          // a request for one speaker is met by the cap below instead.
+          if (maxSpeakers > 1 && isCollapsedDiarization(segments)) {
+            debugLogger.warn("Discarding diarization: one cluster holds nearly all speech", {
+              durationSeconds,
+            });
+            segments = [];
           }
           // The meeting path caps clusters via its expectation resolver; this
           // path fed raw sherpa output to the merge, which is how a 2-person
           // voice memo surfaced 46 speakers.
           segments = dropNegligibleClusters(segments);
-          segments = this.diarizationManager.capSpeakerClusters(
-            segments,
-            numSpeakers > 0 ? numSpeakers : MAX_SPEAKER_COUNT
-          );
+          if (new Set(segments.map((s) => s.speaker)).size > maxSpeakers) {
+            const speakerEmbeddings = require("./speakerEmbeddings");
+            let centroids = new Map();
+            try {
+              centroids = await speakerEmbeddings.extractClusterCentroids(wavPath, segments, {
+                signal,
+              });
+            } catch (error) {
+              debugLogger.warn("Speaker voices unavailable; extra clusters fold into the largest", {
+                error: error.message,
+              });
+            }
+            if (signal?.aborted) {
+              return { success: false, error: "Cancelled", code: "UPLOAD_CANCELLED" };
+            }
+            segments = capSpeakerClustersByVoice(segments, maxSpeakers, centroids, (a, b) =>
+              speakerEmbeddings.cosineSimilarity(a, b)
+            );
+          }
           // Callers persist this as audio_duration_seconds: for picked files
           // the renderer has no other duration source.
           return { success: true, segments, durationSeconds };
@@ -3660,6 +4180,39 @@ class IPCHandlers {
       return this.diarizationManager.cancelDownload();
     });
 
+    // Under `npm run dev` the Vite server dies with Electron, so a relaunched dev
+    // instance would have no renderer: just quit there.
+    ipcMain.handle("relaunch-app", async () => {
+      if (process.env.NODE_ENV === "development") return app.quit();
+      // Once Squirrel.Mac holds a downloaded update it installs it on this quit regardless
+      // of any flag, so the updater owns that restart instead of racing app.relaunch().
+      if (this.updateManager.hasStagedUpdate()) {
+        const { success } = await this.updateManager
+          .installUpdate()
+          .catch(() => ({ success: false }));
+        if (success) return;
+      }
+      this.updateManager.deferInstallOnQuit();
+      const { launcherPath, args } = getRelaunchOptions({
+        argv: process.argv,
+        protocol: this.oauthProtocol,
+        appImagePath: process.env.APPIMAGE,
+      });
+      if (launcherPath) {
+        const waiter = getRelaunchWaiter({ launcherPath, args, pid: process.pid });
+        require("child_process")
+          .spawn(waiter.file, waiter.args, {
+            detached: true,
+            stdio: "ignore",
+            cwd: path.dirname(launcherPath), // never inside the directory being removed
+          })
+          .unref();
+      } else {
+        app.relaunch({ args });
+      }
+      app.quit();
+    });
+
     ipcMain.handle("cleanup-app", async (event) => {
       const fs = require("fs");
       const os = require("os");
@@ -3698,7 +4251,7 @@ class IPCHandlers {
         errors.push(`Diarization stop: ${e.message}`);
       }
       try {
-        await this.getQdrantManager?.()?.stop();
+        await this.getSemanticSearch?.()?.stop();
       } catch (e) {
         errors.push(`Vector index stop: ${e.message}`);
       }
@@ -3714,6 +4267,29 @@ class IPCHandlers {
         await this.googleCalendarManager?.revokeAllTokens();
       } catch (e) {
         errors.push(`GCal revoke: ${e.message}`);
+      }
+
+      // Revoke every connector login stored on this device (Slack, Gmail) at
+      // its provider, for every account: Settings signs out before this
+      // runs, so there may be no signed-in account left. It must run before
+      // the connectors directory is deleted below. Best effort: the revokes
+      // run in parallel under a 5 s deadline and never block the reset.
+      try {
+        await this.connectorManager?.revokeAllStored();
+      } catch (e) {
+        const { describeError } = require("./connectors/errorSummary");
+        const { errorName, errorCode } = describeError(e);
+        errors.push(`Connector revoke: ${errorCode ?? errorName}`);
+      }
+
+      try {
+        this.metaActivation?.dispose();
+        this.metaActivation = null;
+        const activationPath = path.join(app.getPath("userData"), "meta-activation.db");
+        for (const suffix of ["", "-wal", "-shm"])
+          fs.rmSync(activationPath + suffix, { force: true });
+      } catch (e) {
+        errors.push(`Activation data cleanup: ${e.message}`);
       }
 
       // Close DB connection before deleting the file
@@ -3809,7 +4385,9 @@ class IPCHandlers {
       } catch (e) {
         errors.push(`Device setting files: ${e.message}`);
       }
-      for (const directoryName of ["bin", "llama-cpp"]) {
+      // "connectors" holds encrypted connector logins (Slack, Gmail), all
+      // revoked above.
+      for (const directoryName of ["bin", "llama-cpp", "connectors"]) {
         try {
           fs.rmSync(path.join(app.getPath("userData"), directoryName), {
             recursive: true,
@@ -3938,9 +4516,15 @@ class IPCHandlers {
         // On Hyprland Wayland, unregister the keybinding during capture
         if (hotkeyManager.isUsingHyprland() && hotkeyManager.hyprlandManager) {
           debugLogger.log("[IPC] Unregistering Hyprland keybinding for hotkey capture mode");
-          await hotkeyManager.hyprlandManager.unregisterKeybinding().catch((err) => {
-            debugLogger.warn("[IPC] Failed to unregister Hyprland keybinding:", err.message);
-          });
+          const unregistered = await hotkeyManager.hyprlandManager
+            .unregisterKeybinding()
+            .catch((err) => {
+              debugLogger.warn("[IPC] Failed to unregister Hyprland keybinding:", err.message);
+              return false;
+            });
+          if (!unregistered) {
+            debugLogger.warn("[IPC] Hyprland keybinding remained active during capture");
+          }
         }
       } else {
         // Exiting capture mode - re-register globalShortcut if not already registered
@@ -4025,9 +4609,15 @@ class IPCHandlers {
           debugLogger.log(
             `[IPC] Re-registering slot "${slot}" ("${hotkeys.join(", ")}") after capture mode`
           );
-          await hotkeyManager.registerSlot(slot, hotkeys, info.callback).catch((err) => {
-            debugLogger.warn(`[IPC] Failed to re-register slot "${slot}":`, err.message);
-          });
+          const result = await hotkeyManager
+            .registerSlot(slot, hotkeys, info.callback)
+            .catch((err) => {
+              debugLogger.warn(`[IPC] Failed to re-register slot "${slot}":`, err.message);
+              return { success: false };
+            });
+          if (!result.success) {
+            debugLogger.warn(`[IPC] Slot "${slot}" was not restored after capture`);
+          }
         }
       }
 
@@ -4041,12 +4631,7 @@ class IPCHandlers {
           ? requestedHotkey.split(",")[0].trim()
           : hotkeyManager.getCurrentHotkey();
       const isUsingNativeShortcut = this.windowManager.isUsingNativeShortcutHotkeys();
-      const supportsPushToTalk =
-        process.platform === "linux"
-          ? isUsingNativeShortcut
-            ? hotkeyManager.supportsPushToTalk(hotkey)
-            : this.linuxKeyManager?.isAvailable?.() === true
-          : !isUsingNativeShortcut;
+      const supportsPushToTalk = hotkeyManager.supportsPushToTalk(hotkey);
 
       return {
         isUsingGnome: this.windowManager.isUsingGnomeHotkeys(),
@@ -4057,6 +4642,12 @@ class IPCHandlers {
         pushToTalkUnavailableReason: supportsPushToTalk
           ? null
           : hotkeyManager.getPushToTalkUnavailableReason(hotkey),
+        // Lets the renderer show the setup box outside push mode, where the
+        // disabled-Hold tooltip is the only other place this surfaces. Desktop
+        // backends see their own hotkeys, so access matters only without one.
+        linuxInputAccessDenied:
+          hotkeyManager.reliesOnLinuxKeyListener() &&
+          hotkeyManager.nativeListenerProbe().reason === "input_access_denied",
       };
     });
 
@@ -4275,7 +4866,10 @@ class IPCHandlers {
       serializeIpcError(async (event, { audioBuffer, language, keyterms }) => {
         const apiKey = this.environmentManager.getXaiKey();
         if (!apiKey) {
-          throw new Error("xAI API key not configured");
+          throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+            provider: "xAI",
+            surface: "transcription",
+          });
         }
 
         const formData = new FormData();
@@ -4300,7 +4894,17 @@ class IPCHandlers {
 
         if (!response.ok) {
           const errorText = await response.text();
-          throw new Error(`xAI API Error: ${response.status} ${errorText}`);
+          debugLogger.warn("xAI transcription failed", {
+            status: response.status,
+            body: redactProviderBody(errorText),
+          });
+          throw providerHttpError({
+            provider: "xAI",
+            status: response.status,
+            body: errorText,
+            headers: response.headers,
+            surface: "transcription",
+          });
         }
 
         return await response.json();
@@ -4312,13 +4916,17 @@ class IPCHandlers {
       serializeIpcError(async (event, { audioBuffer, model, language, contextBias }) => {
         const apiKey = this.environmentManager.getMistralKey();
         if (!apiKey) {
-          throw new Error("Mistral API key not configured");
+          throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+            provider: "Mistral",
+            surface: "transcription",
+          });
         }
 
+        const transcriptionModel = model || "voxtral-mini-latest";
         const formData = new FormData();
         const audioBlob = new Blob([Buffer.from(audioBuffer)], { type: "audio/webm" });
         formData.append("file", audioBlob, "audio.webm");
-        formData.append("model", model || "voxtral-mini-latest");
+        formData.append("model", transcriptionModel);
         if (language && language !== "auto") {
           formData.append("language", language);
         }
@@ -4338,7 +4946,18 @@ class IPCHandlers {
 
         if (!response.ok) {
           const errorText = await response.text();
-          throw new Error(`Mistral API Error: ${response.status} ${errorText}`);
+          debugLogger.warn("Mistral transcription failed", {
+            status: response.status,
+            body: redactProviderBody(errorText),
+          });
+          throw providerHttpError({
+            provider: "Mistral",
+            model: transcriptionModel,
+            status: response.status,
+            body: errorText,
+            headers: response.headers,
+            surface: "transcription",
+          });
         }
 
         return await response.json();
@@ -4349,17 +4968,19 @@ class IPCHandlers {
       return this.environmentManager.getCortiClientId();
     });
 
-    ipcMain.handle("save-corti-client-id", async (event, key) => {
-      return this.environmentManager.saveCortiClientId(key);
-    });
+    ipcMain.handle(
+      "save-corti-client-id",
+      saveSecretKey("getCortiClientId", "saveCortiClientId", "cortiClientId")
+    );
 
     ipcMain.handle("get-corti-client-secret", async () => {
       return this.environmentManager.getCortiClientSecret();
     });
 
-    ipcMain.handle("save-corti-client-secret", async (event, key) => {
-      return this.environmentManager.saveCortiClientSecret(key);
-    });
+    ipcMain.handle(
+      "save-corti-client-secret",
+      saveSecretKey("getCortiClientSecret", "saveCortiClientSecret", "cortiClientSecret")
+    );
 
     ipcMain.handle(
       "proxy-corti-transcription",
@@ -4367,7 +4988,10 @@ class IPCHandlers {
         const clientId = this.environmentManager.getCortiClientId();
         const clientSecret = this.environmentManager.getCortiClientSecret();
         if (!clientId || !clientSecret) {
-          throw new Error("Corti credentials not configured");
+          throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+            provider: "Corti",
+            surface: "transcription",
+          });
         }
 
         const { transcribeAudio } = require("./cortiTranscription");
@@ -4421,17 +5045,23 @@ class IPCHandlers {
       return this.environmentManager.getCustomTranscriptionKey();
     });
 
-    ipcMain.handle("save-custom-transcription-key", async (event, key) => {
-      return this.environmentManager.saveCustomTranscriptionKey(key);
-    });
+    ipcMain.handle(
+      "save-custom-transcription-key",
+      saveSecretKey(
+        "getCustomTranscriptionKey",
+        "saveCustomTranscriptionKey",
+        "customTranscriptionApiKey"
+      )
+    );
 
     ipcMain.handle("get-cleanup-custom-key", async () => {
       return this.environmentManager.getCleanupCustomKey();
     });
 
-    ipcMain.handle("save-cleanup-custom-key", async (event, key) => {
-      return this.environmentManager.saveCleanupCustomKey(key);
-    });
+    ipcMain.handle(
+      "save-cleanup-custom-key",
+      saveSecretKey("getCleanupCustomKey", "saveCleanupCustomKey", "cleanupCustomApiKey")
+    );
 
     // Enterprise provider key handlers
     ipcMain.handle("get-bedrock-region", async () => {
@@ -4449,21 +5079,28 @@ class IPCHandlers {
     ipcMain.handle("get-bedrock-access-key-id", async () => {
       return this.environmentManager.getBedrockAccessKeyId();
     });
-    ipcMain.handle("save-bedrock-access-key-id", async (event, key) => {
-      return this.environmentManager.saveBedrockAccessKeyId(key);
-    });
+    ipcMain.handle(
+      "save-bedrock-access-key-id",
+      saveSecretKey("getBedrockAccessKeyId", "saveBedrockAccessKeyId", "bedrockAccessKeyId")
+    );
     ipcMain.handle("get-bedrock-secret-access-key", async () => {
       return this.environmentManager.getBedrockSecretAccessKey();
     });
-    ipcMain.handle("save-bedrock-secret-access-key", async (event, key) => {
-      return this.environmentManager.saveBedrockSecretAccessKey(key);
-    });
+    ipcMain.handle(
+      "save-bedrock-secret-access-key",
+      saveSecretKey(
+        "getBedrockSecretAccessKey",
+        "saveBedrockSecretAccessKey",
+        "bedrockSecretAccessKey"
+      )
+    );
     ipcMain.handle("get-bedrock-session-token", async () => {
       return this.environmentManager.getBedrockSessionToken();
     });
-    ipcMain.handle("save-bedrock-session-token", async (event, key) => {
-      return this.environmentManager.saveBedrockSessionToken(key);
-    });
+    ipcMain.handle(
+      "save-bedrock-session-token",
+      saveSecretKey("getBedrockSessionToken", "saveBedrockSessionToken", "bedrockSessionToken")
+    );
     ipcMain.handle("get-azure-endpoint", async () => {
       return this.environmentManager.getAzureEndpoint();
     });
@@ -4473,9 +5110,10 @@ class IPCHandlers {
     ipcMain.handle("get-azure-api-key", async () => {
       return this.environmentManager.getAzureApiKey();
     });
-    ipcMain.handle("save-azure-api-key", async (event, key) => {
-      return this.environmentManager.saveAzureApiKey(key);
-    });
+    ipcMain.handle(
+      "save-azure-api-key",
+      saveSecretKey("getAzureApiKey", "saveAzureApiKey", "azureApiKey")
+    );
     ipcMain.handle("get-azure-deployment", async () => {
       return this.environmentManager.getAzureDeployment();
     });
@@ -4503,9 +5141,10 @@ class IPCHandlers {
     ipcMain.handle("get-vertex-api-key", async () => {
       return this.environmentManager.getVertexApiKey();
     });
-    ipcMain.handle("save-vertex-api-key", async (event, key) => {
-      return this.environmentManager.saveVertexApiKey(key);
-    });
+    ipcMain.handle(
+      "save-vertex-api-key",
+      saveSecretKey("getVertexApiKey", "saveVertexApiKey", "vertexApiKey")
+    );
 
     // Enterprise provider test connection
     ipcMain.handle("test-enterprise-connection", async (event, provider, config) => {
@@ -4666,7 +5305,9 @@ class IPCHandlers {
               config?.requireCompleteOutput &&
               ["length", "max-tokens", "max_tokens"].includes(finishReason)
             ) {
-              throw new Error("Model output was truncated before the selection edit completed");
+              throw Object.assign(new Error("Model output was truncated"), {
+                messageKey: CLEANUP_TRUNCATED_MESSAGE_KEY,
+              });
             }
 
             return { success: true, text: (generated || "").trim() };
@@ -4686,7 +5327,9 @@ class IPCHandlers {
           return {
             success: false,
             error: mapped.message,
-            messageKey: mapped.messageKey,
+            // mapEnterpriseError matches provider failures, so a truncation falls through
+            // to its generic mapping — keep the key the throw site set.
+            messageKey: err.messageKey || mapped.messageKey,
             messageParams: mapped.messageParams,
             action: mapped.action,
             actionKey: mapped.actionKey,
@@ -4868,8 +5511,10 @@ class IPCHandlers {
       return this.windowManager?.hotkeyManager?.getEffectiveDefaultHotkey() ?? null;
     });
 
+    // The mode in effect: startup can fall back to Tap for this session while
+    // the saved preference stays Hold for the next launch.
     ipcMain.handle("get-activation-mode", async () => {
-      return this.environmentManager.getActivationMode();
+      return this.windowManager.getActivationMode();
     });
 
     ipcMain.handle("save-activation-mode", async (event, mode) => {
@@ -4940,34 +5585,47 @@ class IPCHandlers {
         });
       }
 
-      const localServer = resolveLocalServerNeeds(prefs);
-
-      if (localServer.cleanup) {
-        setVars.CLEANUP_PROVIDER = "local";
-        setVars.LOCAL_CLEANUP_MODEL = localServer.cleanup;
-      } else {
-        clearVars.push("CLEANUP_PROVIDER", "LOCAL_CLEANUP_MODEL");
-      }
       // TODO: drop legacy REASONING_PROVIDER / LOCAL_REASONING_MODEL clears once
       // the read fallback is removed (~2 releases after this lands).
       clearVars.push("REASONING_PROVIDER", "LOCAL_REASONING_MODEL");
 
-      if (localServer.dictationAgent) {
-        setVars.DICTATION_AGENT_PROVIDER = "local";
-        setVars.LOCAL_DICTATION_AGENT_MODEL = localServer.dictationAgent;
-      } else {
-        clearVars.push("DICTATION_AGENT_PROVIDER", "LOCAL_DICTATION_AGENT_MODEL");
-      }
+      // No workspace policy governs this, so it applies before the policy settles.
+      const modelManager = require("./modelManagerBridge").default;
+      modelManager.serverManager.setKeepResident(prefs.keepLocalModelLoaded === true);
 
-      // Stop the shared llama-server only when neither scope still needs it, so
-      // the active scope keeps its server when the other one switches away.
-      if (localServer.stopServer) {
-        const modelManager = require("./modelManagerBridge").default;
-        modelManager.stopServer().catch((err) => {
-          debugLogger.error("Failed to stop llama-server on provider switch", {
-            error: err.message,
+      // A signed-in window whose workspace policy is still loading reports
+      // unclamped modes, so it neither pre-warms nor stops the shared
+      // llama-server; signed out, the policy never loads.
+      if (prefs.policySettled || !this._hasActiveAccountScope()) {
+        const localServer = resolveLocalServerNeeds(prefs);
+
+        if (localServer.cleanup) {
+          setVars.CLEANUP_PROVIDER = "local";
+          setVars.LOCAL_CLEANUP_MODEL = localServer.cleanup;
+        } else {
+          clearVars.push("CLEANUP_PROVIDER", "LOCAL_CLEANUP_MODEL");
+        }
+
+        if (localServer.dictationAgent) {
+          setVars.DICTATION_AGENT_PROVIDER = "local";
+          setVars.LOCAL_DICTATION_AGENT_MODEL = localServer.dictationAgent;
+        } else {
+          clearVars.push("DICTATION_AGENT_PROVIDER", "LOCAL_DICTATION_AGENT_MODEL");
+        }
+
+        // Stop the shared llama-server only when no scope still needs the model
+        // it holds, so the active scopes keep their server when another leaves.
+        if (shouldStopLocalServer(localServer, modelManager.currentServerModelId)) {
+          if (modelManager.getServerStatus().running) {
+            debugLogger.debug("Stopping llama-server: no scope needs its model", {
+              loadedModel: modelManager.currentServerModelId,
+              neededModels: localServer.models,
+            });
+          }
+          modelManager.stopServer().catch((err) => {
+            debugLogger.error("Failed to stop llama-server", { error: err.message });
           });
-        });
+        }
       }
 
       this._syncStartupEnv(setVars, clearVars);
@@ -4978,6 +5636,38 @@ class IPCHandlers {
         const LocalReasoningService = require("../services/localReasoningBridge").default;
         const result = await LocalReasoningService.processText(text, modelId, config);
         return { success: true, text: result };
+      } catch (error) {
+        // code/details carry the machine-readable failure across to the
+        // renderer, which owns the translation keys. Flattening to a bare
+        // string is how llama.cpp JSON used to reach users (#2142).
+        return {
+          success: false,
+          error: error.message,
+          code: error.code,
+          details: error.details,
+        };
+      }
+    });
+
+    ipcMain.handle("cancel-local-reasoning", (event, requestId) => {
+      require("../services/localReasoningBridge").default.cancel(requestId);
+    });
+
+    // After a local refusal, the renderer plans a note's parts against this
+    // number (#2142 part 3). It is the same ceiling runInference sizes against,
+    // so a part the renderer judges to fit is one the main process will accept
+    // without a restart it cannot afford.
+    ipcMain.handle("get-local-context-budget", async (event, modelId) => {
+      try {
+        const modelManager = require("./modelManagerBridge").default;
+        modelManager.ensureInitialized();
+        const modelInfo = modelManager.findModelById(modelId);
+        if (!modelInfo) {
+          return { success: false, error: `Model "${modelId}" not found` };
+        }
+        const modelPath = require("path").join(modelManager.modelsDir, modelInfo.model.fileName);
+        const { ceiling } = await modelManager.contextCeiling(modelInfo, modelPath);
+        return { success: true, maxContextTokens: ceiling, modelName: modelInfo.model.name };
       } catch (error) {
         return { success: false, error: error.message };
       }
@@ -4990,7 +5680,10 @@ class IPCHandlers {
           const apiKey = this.environmentManager.getAnthropicKey();
 
           if (!apiKey) {
-            throw new Error("Anthropic API key not configured");
+            throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+              provider: "Anthropic",
+              surface: "llm",
+            });
           }
 
           const systemPrompt = config?.systemPrompt || "";
@@ -5038,31 +5731,47 @@ class IPCHandlers {
 
           if (!response.ok) {
             const errorText = await response.text();
-            let errorData = { error: response.statusText };
-            try {
-              errorData = JSON.parse(errorText);
-            } catch {
-              errorData = { error: errorText || response.statusText };
-            }
-            throw new Error(
-              errorData.error?.message ||
-                errorData.error ||
-                `Anthropic API error: ${response.status}`
-            );
+            debugLogger.warn("Anthropic API error", {
+              status: response.status,
+              body: redactProviderBody(errorText),
+            });
+            return {
+              success: false,
+              ...ipcErrorFields(
+                providerHttpError({
+                  provider: "Anthropic",
+                  model: modelId,
+                  status: response.status,
+                  body: errorText,
+                  headers: response.headers,
+                  surface: "llm",
+                })
+              ),
+            };
           }
 
           const data = await response.json();
           if (config?.requireCompleteOutput && data.stop_reason === "max_tokens") {
-            throw new Error("Model output was truncated before the selection edit completed");
+            throw Object.assign(new Error("Model output was truncated"), {
+              messageKey: CLEANUP_TRUNCATED_MESSAGE_KEY,
+            });
           }
           const outputText = extractAnthropicText(data);
           if (outputText === null) {
-            throw new Error(describeMissingAnthropicText(data));
+            throw Object.assign(new Error(describeMissingAnthropicText(data)), {
+              messageKey: CLEANUP_EMPTY_REPLY_MESSAGE_KEY,
+            });
           }
           return { success: true, text: outputText };
         } catch (error) {
           debugLogger.error("Anthropic reasoning error:", error);
-          return { success: false, error: error.message };
+          // A network failure rejects proxyFetch before any response.
+          return {
+            success: false,
+            ...ipcErrorFields(
+              asProviderError(error, { provider: "Anthropic", model: modelId, surface: "llm" })
+            ),
+          };
         }
       }
     );
@@ -5126,16 +5835,6 @@ class IPCHandlers {
 
         this.environmentManager.saveAllKeysToEnvFile().catch(() => {});
         return { success: true, port: modelManager.serverManager.port };
-      } catch (error) {
-        return { success: false, error: error.message };
-      }
-    });
-
-    ipcMain.handle("llama-server-stop", async () => {
-      try {
-        const modelManager = require("./modelManagerBridge").default;
-        await modelManager.stopServer();
-        return { success: true };
       } catch (error) {
         return { success: false, error: error.message };
       }
@@ -5480,18 +6179,6 @@ class IPCHandlers {
 
     ipcMain.handle("open-calendar-privacy-settings", () => openSystemSettings("calendars"));
 
-    ipcMain.handle("show-emoji-panel", () => {
-      try {
-        if (app.isEmojiPanelSupported()) {
-          app.showEmojiPanel();
-          return true;
-        }
-      } catch (error) {
-        debugLogger.error("Failed to show native emoji panel:", error);
-      }
-      return false;
-    });
-
     ipcMain.handle("toggle-media-playback", () => {
       const mediaPlayer = require("./mediaPlayer");
       return mediaPlayer.toggleMedia();
@@ -5613,6 +6300,12 @@ class IPCHandlers {
 
     ipcMain.handle("check-system-audio-access", () => getSystemAudioAccess());
 
+    ipcMain.handle("permission-guide-verify-system-audio", async () => {
+      if (!this.audioTapManager?.isSupported()) return buildSystemAudioAccess();
+      const result = await this.audioTapManager.requestAccess();
+      return buildSystemAudioAccess({ ...result, mode: "native", strategy: "native" });
+    });
+
     ipcMain.handle("request-system-audio-access", async () => {
       if (process.platform === "win32") {
         return getWindowsSystemAudioAccess();
@@ -5652,6 +6345,10 @@ class IPCHandlers {
 
     ipcMain.handle("auth-clear-session", async (event) => {
       try {
+        await Promise.race([
+          this.metaActivation?.close(),
+          new Promise((resolve) => setTimeout(resolve, 1500)),
+        ]).catch(() => {});
         const tokenState = tokenStore.clear();
         const win = BrowserWindow.fromWebContents(event.sender);
         if (win) {
@@ -5787,6 +6484,46 @@ class IPCHandlers {
       tokenStore,
       logger: debugLogger,
     });
+    try {
+      const ActivationDatabase = require("better-sqlite3");
+      const activationDb = new ActivationDatabase(
+        path.join(app.getPath("userData"), "meta-activation.db")
+      );
+      activationDb.pragma("foreign_keys = ON");
+      this.metaActivation = new MetaActivation({
+        db: activationDb,
+        getScope: () =>
+          accountScopeBinding.resolveActiveAccountScope({
+            ...tokenStore.getState(),
+            binding: accountScopeBinding.read(),
+          }),
+        request: createCloudApiRequestHandler({
+          getApiUrl,
+          getAppVersion: () => app.getVersion(),
+          tokenStore,
+          proxyFetch: (url, init) =>
+            proxyFetch(url, { ...init, signal: AbortSignal.timeout(10_000) }),
+        }),
+      });
+      this.metaActivation.start();
+    } catch {
+      // Marketing bookkeeping must never prevent ordinary dictation/startup.
+      debugLogger.warn("Activation storage unavailable");
+    }
+    ipcMain.handle("activation-close", async () => {
+      await Promise.race([
+        this.metaActivation?.close(),
+        new Promise((resolve) => setTimeout(resolve, 1500)),
+      ]).catch(() => {});
+    });
+    ipcMain.handle("activation-begin", () => this.metaActivation?.begin() ?? null);
+    ipcMain.handle("activation-stop", (_event, id) => {
+      if (typeof id === "string") this.metaActivation?.stopCapture(id);
+    });
+    ipcMain.handle("activation-finish", (_event, id, words) =>
+      this.metaActivation?.finish(id, words)
+    );
+    ipcMain.handle("activation-cancel", (_event, id) => this.metaActivation?.cancel(id));
     const workspacePolicyManager = createWorkspacePolicyManager({
       cachePath: path.join(app.getPath("userData"), "workspace-policy.json"),
       getApiUrl,
@@ -5796,6 +6533,75 @@ class IPCHandlers {
       broadcast: (snapshot) => broadcastToWindows("workspace-policy-changed", snapshot),
       logger: debugLogger,
     });
+    registerProductHelpIpc({
+      ipcMain,
+      fetch: proxyFetch,
+      canLookup: createConnectorPolicyResolver({
+        getAuthHeader: createConnectorAuthLookup({
+          hasBearerToken: () => Boolean(tokenStore.get()),
+          windowFor: (event) => BrowserWindow.fromWebContents(event.sender),
+          authHeaderFor: getAuthHeaderFromWindow,
+        }),
+        getPolicy: (options) => workspacePolicyManager.getPolicy(options),
+        peekPolicy: (options) => workspacePolicyManager.peekPolicy(options),
+        getAuthGeneration: () => tokenStore.getState().generation,
+        classifySnapshot: (snapshot) => remoteHelpPolicyState(snapshot, app.getVersion()),
+        fallbackOnUnavailable: true,
+      }),
+      getBasics: () => ({
+        // checkAccess reads the cached permission verdict; it never requests access.
+        systemAudioPermission:
+          process.platform === "darwin"
+            ? this.audioTapManager?.checkAccess()?.status || "unknown"
+            : "unknown",
+        platform: process.platform,
+        version: app.getVersion(),
+        microphonePermission:
+          process.platform === "linux"
+            ? "unknown"
+            : systemPreferences.getMediaAccessStatus("microphone"),
+        accessibilityPermission:
+          process.platform === "darwin"
+            ? systemPreferences.isTrustedAccessibilityClient(false)
+              ? "granted"
+              : "not-granted"
+            : "not-applicable",
+      }),
+    });
+    if (this.connectorManager) {
+      registerConnectorIpc({
+        ipcMain,
+        manager: this.connectorManager,
+        getPolicyState: createConnectorPolicyResolver({
+          getAuthHeader: createConnectorAuthLookup({
+            hasBearerToken: () => Boolean(tokenStore.get()),
+            windowFor: (event) => BrowserWindow.fromWebContents(event.sender),
+            authHeaderFor: getAuthHeaderFromWindow,
+          }),
+          getPolicy: (options) => workspacePolicyManager.getPolicy(options),
+          peekPolicy: (options) => workspacePolicyManager.peekPolicy(options),
+          getAuthGeneration: () => tokenStore.getState().generation,
+        }),
+        // The account bound to the credential in use, the same binding
+        // get-active-account-scope serves (not the separately synced
+        // database scope, which lags a sign-in or account switch).
+        getAccountScope: () =>
+          accountScopeBinding.resolveActiveAccountScope({
+            ...tokenStore.getState(),
+            binding: accountScopeBinding.read(),
+          }),
+        findContacts: (query) =>
+          searchContacts(this.databaseManager.getContactLookupSources(), query),
+        noteAttendees: createNoteAttendeesLookup({
+          getContactLookupSources: () => this.databaseManager.getContactLookupSources(),
+          getCalendarEventById: (id) => this.databaseManager.getCalendarEventById(id),
+          getSpeakerMappings: (noteId) => this.databaseManager.getSpeakerMappings(noteId),
+          getSpeakerProfiles: () => this.databaseManager.getSpeakerProfiles(),
+          getGmailAddress: async () =>
+            (await this.connectorManager.connectorStatus("gmail"))?.accountLabel ?? null,
+        }),
+      });
+    }
     this.enterpriseIdentityManager = createEnterpriseIdentityManager({
       cachePath: path.join(app.getPath("userData"), "managed-enterprise-config.json"),
       getApiUrl,
@@ -5936,6 +6742,15 @@ class IPCHandlers {
           clientTranscriptionId,
           localDate: opts.localDate,
           analyticsOccurredAt: opts.analyticsOccurredAt,
+          streamingFallbackReason: opts.streamingFallbackReason,
+          sttDetectedLanguage: opts.sttDetectedLanguage,
+          sttDetectedLanguageConfidence: opts.sttDetectedLanguageConfidence,
+          sttDetectedLanguageAudioSeconds: opts.sttDetectedLanguageAudioSeconds,
+          sttDetectedLanguageStatus: opts.sttDetectedLanguageStatus,
+          orukeetLanguageRouting: opts.orukeetLanguageRouting
+            ? JSON.stringify(opts.orukeetLanguageRouting)
+            : undefined,
+          orukeetCleanup: opts.orukeetCleanup ? JSON.stringify(opts.orukeetCleanup) : undefined,
         };
 
         debugLogger.debug("Cloud transcribe request", { audioSize: audioData.length }, "cloud-api");
@@ -6052,6 +6867,7 @@ class IPCHandlers {
     ipcMain.handle("retry-transcription", async (event, id, settings) => {
       const buffer = this.audioStorageManager.getAudioBuffer(id);
       if (!buffer) return { success: false, error: "Audio file not found" };
+      let providerErrorContext = null;
       try {
         let result;
         const preferredLanguage = settings?.preferredLanguage;
@@ -6060,6 +6876,7 @@ class IPCHandlers {
             ? preferredLanguage.split("-")[0]
             : undefined;
         const { resolveTranscriptionRoute } = await import("./transcriptionRoute.ts");
+        const { convertBufferToWav, isWavFormat } = require("./ffmpegUtils");
         // Renderer pre-flight owns policy; retry re-routes stored audio through
         // whatever is selected NOW.
         const route = resolveTranscriptionRoute({
@@ -6080,6 +6897,22 @@ class IPCHandlers {
           if (route.code) err.code = route.code;
           if (route.messageKey) err.messageKey = route.messageKey;
           throw err;
+        }
+
+        // Mirrors the branch order below: self-hosted wins over OpenWhispr
+        // cloud, which wins over the BYOK providers. Managed, local and cloud
+        // failures keep their own shape.
+        if (
+          (route.transport === "http-batch" && route.provider === "self-hosted") ||
+          ((route.transport === "http-batch" || route.transport === "proxied") &&
+            settings?.cloudTranscriptionMode !== "openwhispr")
+        ) {
+          providerErrorContext = {
+            provider: transcriptionProviderName(route.provider),
+            selfHosted: route.provider === "self-hosted" || route.provider === "custom",
+            model: route.model,
+            surface: "transcription",
+          };
         }
 
         if (route.transport === "managed") {
@@ -6105,16 +6938,23 @@ class IPCHandlers {
           });
           if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`Self-hosted API Error: ${response.status} ${errorText}`);
+            debugLogger.warn("Self-hosted retry failed", {
+              status: response.status,
+              body: redactProviderBody(errorText),
+            });
+            throw providerHttpError({
+              ...providerErrorContext,
+              status: response.status,
+              body: errorText,
+              headers: response.headers,
+            });
           }
           const data = await response.json();
-          if (data?.text) {
-            result = {
-              text: data.text,
-              source: "self-hosted",
-              model: route.model,
-            };
-          }
+          result = {
+            text: data?.text,
+            source: "self-hosted",
+            model: route.model,
+          };
         } else if (route.transport === "local") {
           if (isSherpaLocalProvider(settings.localTranscriptionProvider)) {
             const model =
@@ -6149,13 +6989,13 @@ class IPCHandlers {
                   sessionId: this.sessionId,
                 };
                 if (buffer.length > CLOUD_INLINE_LIMIT) {
-                  const { text } = await chunkedCloudTranscribe({
+                  const { text, warning } = await chunkedCloudTranscribe({
                     buffer,
                     apiUrl,
                     policyHeaders: withPolicyHeaders(authHeader),
                     multipartFields,
                   });
-                  result = { text, source: "openwhispr", model: "cloud" };
+                  result = { text, source: "openwhispr", model: "cloud", warning };
                 } else {
                   const { body, boundary } = buildMultipartBody(
                     buffer,
@@ -6193,14 +7033,17 @@ class IPCHandlers {
             language: route.language,
             apiKey: this.environmentManager.getTinfoilKey(),
           });
-          if (text) result = { text, source: "tinfoil", model };
+          result = { text, source: "tinfoil", model };
         } else if (route.transport === "proxied" && route.provider === "corti") {
           // Corti uses OAuth + an interaction-based REST flow, so it can't use
           // the generic fetch below.
           const clientId = this.environmentManager.getCortiClientId();
           const clientSecret = this.environmentManager.getCortiClientSecret();
           if (!clientId || !clientSecret) {
-            throw new Error("Corti credentials not configured. Add them in Settings.");
+            throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+              provider: "Corti",
+              surface: "transcription",
+            });
           }
           const { transcribeAudio } = require("./cortiTranscription");
           const { text } = await transcribeAudio({
@@ -6211,7 +7054,7 @@ class IPCHandlers {
             audioBuffer: buffer,
             language: route.language,
           });
-          if (text) result = { text, source: "corti", model: route.model };
+          result = { text, source: "corti", model: route.model };
         } else if (route.transport === "proxied" && route.provider === "gemini") {
           if (route.sizeCapBytes && buffer.byteLength > route.sizeCapBytes) {
             throw new Error(byokSizeCapError(route.sizeCapBytes));
@@ -6223,7 +7066,7 @@ class IPCHandlers {
             language: route.language,
             apiKey: this.environmentManager.getGeminiKey(),
           });
-          if (text) result = { text, source: "gemini", model: route.model };
+          result = { text, source: "gemini", model: route.model };
         } else {
           // mistral/xai have no OpenAI-compatible endpoint — main talks to them
           // directly; everything else consumes the route endpoint as-is.
@@ -6245,11 +7088,41 @@ class IPCHandlers {
                     ? this.environmentManager.getGroqKey()
                     : this.environmentManager.getOpenAIKey();
           if (!apiKey && provider !== "custom") {
-            throw new Error(`${provider} API key not configured`);
+            throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+              provider: transcriptionProviderName(provider),
+              surface: "transcription",
+            });
+          }
+
+          // The renderer re-encodes WebM before uploading to a Custom endpoint
+          // (src/utils/audioContainer.ts); retries re-upload stored audio from
+          // the main process, so without the same step here every retry of a
+          // dictation that failed for that reason fails again -- which is the
+          // exact recovery a user reaches for after hitting it.
+          let uploadBuffer = buffer;
+          let uploadType = "audio/webm";
+          let uploadName = "audio.webm";
+          if (provider === "custom" && buffer.length && !isWavFormat(buffer)) {
+            try {
+              const wavBuffer = await convertBufferToWav(buffer);
+              // Match fresh dictation: PCM expansion must not break an upload
+              // that the endpoint could accept in its original container.
+              if (wavBuffer.length <= route.sizeCapBytes) {
+                uploadBuffer = wavBuffer;
+                uploadType = "audio/wav";
+                uploadName = "audio.wav";
+              }
+            } catch (conversionError) {
+              // Fail open, matching the renderer: an unconverted retry is no
+              // worse than today's behaviour.
+              debugLogger.warn("WAV re-encode failed on retry; uploading stored container", {
+                error: conversionError?.message,
+              });
+            }
           }
 
           const formData = new FormData();
-          formData.append("file", new Blob([buffer], { type: "audio/webm" }), "audio.webm");
+          formData.append("file", new Blob([uploadBuffer], { type: uploadType }), uploadName);
           if (provider === "xai") {
             // xAI STT does not accept a model field; the route pre-filters language
             if (route.language) {
@@ -6274,16 +7147,32 @@ class IPCHandlers {
           const response = await proxyFetch(endpoint, { method: "POST", headers, body: formData });
           if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`${provider} API Error: ${response.status} ${errorText}`);
+            debugLogger.warn("Retry transcription provider failed", {
+              provider,
+              status: response.status,
+              body: redactProviderBody(errorText),
+            });
+            throw providerHttpError({
+              ...providerErrorContext,
+              status: response.status,
+              body: errorText,
+              headers: response.headers,
+            });
           }
           const data = await response.json();
-          if (data?.text) {
-            result = { text: data.text, source: provider, model: route.model };
-          }
+          result = { text: data?.text, source: provider, model: route.model };
         }
 
-        if (!result?.text) {
+        if (result?.success === false) {
+          throw localTranscriptionFailure(result);
+        }
+        if (!result) {
           return { success: false, error: "No transcription engine available" };
+        }
+        if (!result.text) {
+          throw Object.assign(new Error("No speech detected in audio"), {
+            code: "NO_SPEECH_DETECTED",
+          });
         }
 
         this.databaseManager.updateTranscriptionText(id, result.text, result.text);
@@ -6301,17 +7190,33 @@ class IPCHandlers {
         if (updated) {
           setImmediate(() => {
             broadcastToWindows("transcription-updated", updated);
+            // A row that just reached "completed" is newly eligible.
+            void this._ensureAnalyticsHistoryBackfilled();
           });
         }
-        return { success: true, transcription: updated };
-      } catch (error) {
+        // A partial result (local truncation, lost cloud chunks) still replaces the
+        // row, as dictation keeps it, but the renderer must say so.
+        return {
+          success: true,
+          transcription: updated,
+          ...(result.warning ? { warning: result.warning } : {}),
+        };
+      } catch (rawError) {
+        const error = providerErrorContext
+          ? asProviderError(rawError, providerErrorContext)
+          : rawError;
         debugLogger.error(
           "Retry transcription failed",
           { id, error: error.message, code: error.code },
           "audio-storage"
         );
+        if (error.code === "NO_SPEECH_DETECTED" && !error.messageKey) {
+          // Every engine reports silence with this code, so it is translated
+          // here once rather than per route.
+          error.messageKey = "notes.upload.noSpeechDetected";
+        }
         if (error.code) {
-          return { success: false, error: error.message, code: error.code, ...error };
+          return { success: false, ...ipcErrorFields(error) };
         }
         return { success: false, error: error.message };
       }
@@ -6562,7 +7467,7 @@ class IPCHandlers {
       meetingMicDiarizationPath = null;
       meetingMicDiarizationStartedAt = null;
       meetingSystemAudioHeard = false;
-      meetingSystemAudioDegraded = false;
+      meetingSystemAudioHandover.reset();
       meetingDiarizationSegments = [];
       const { pcmPath, startedAt, diarizedSource, cleanupPcmPaths } = resolveDiarizationInput({
         systemPcmPath,
@@ -6830,6 +7735,7 @@ class IPCHandlers {
           const connectOpts = {
             model: options.model,
             language: options.language,
+            mode: options.mode,
             preconfigured: options.mode !== "byok",
             environment: options.environment,
             tenant: options.tenant,
@@ -6886,7 +7792,7 @@ class IPCHandlers {
           resetMeetingReconnectAudio();
           oldMic?.disconnect().catch(() => {});
           oldSystem?.disconnect().catch(() => {});
-          meetingConnectionKey = getMeetingConnectionKey(options);
+          meetingConnectionKey = getMeetingConnectionKey(options, credentialGeneration);
 
           debugLogger.info("Meeting streams reconnected", { attempt: meetingReconnectCount });
           meetingReconnectCount = 0;
@@ -6919,7 +7825,12 @@ class IPCHandlers {
           }
           resetMeetingReconnectAudio();
           if (!win.isDestroyed()) {
-            win.webContents.send("meeting-transcription-error", error.message);
+            // A renewal refused for the session gets a sentinel the renderer explains,
+            // instead of the API's bare "Invalid session" (#2427).
+            win.webContents.send(
+              "meeting-transcription-error",
+              isSignInRefusal(error) ? "signInExpired" : error.message
+            );
           }
           return canRestoreOld;
         }
@@ -6932,39 +7843,13 @@ class IPCHandlers {
     };
 
     const fetchRealtimeToken = async (event, options, { streams } = {}) => {
-      const postServerToken = async (path, body = {}) => {
-        const apiUrl = getApiUrl();
-        if (!apiUrl) {
-          const err = new Error("OpenWhispr API URL not configured");
-          err.code = "NO_API";
-          throw err;
-        }
-        const authHeader = await getAuthHeader(event);
-        if (!Object.keys(authHeader).length) throw new Error("Not authenticated");
-        const url = `${apiUrl}${path}`;
-        let response;
-        try {
-          response = await proxyFetch(url, {
-            method: "POST",
-            headers: withPolicyHeaders({ "Content-Type": "application/json", ...authHeader }),
-            body: JSON.stringify(body),
-          });
-        } catch (err) {
-          const classified = classifyAndLog(err, url);
-          if (classified.isNetworkError) {
-            throw Object.assign(new Error(err.message || "Network request failed"), {
-              code: "NETWORK_ERROR",
-              networkCode: classified.code,
-              messageKey: classified.messageKey,
-            });
-          }
-          throw err;
-        }
-        if (!response.ok) {
-          throw await readPolicyResponseError(response, `Token request failed: ${response.status}`);
-        }
-        return response.json();
-      };
+      const postServerToken = createServerTokenPoster({
+        getApiUrl,
+        getAuthHeader: () => getAuthHeader(event),
+        proxyFetch,
+        withPolicyHeaders,
+        classifyAndLog,
+      });
 
       return fetchRealtimeTokenForProvider(
         options.provider,
@@ -7025,7 +7910,8 @@ class IPCHandlers {
       (systemAudioMode === "unsupported" || !!this._meetingSystemStreaming?.isConnected);
 
     const connectRealtimeStreaming = async (event, options) => {
-      const connectionKey = getMeetingConnectionKey(options);
+      // Read before the key is, so a save during the token fetch marks these connections stale.
+      const connectionKey = getMeetingConnectionKey(options, credentialGeneration);
       const StreamingClass = getMeetingStreamingClient(options.provider);
       if (this._meetingMicStreaming?.isConnected) {
         await this._meetingMicStreaming.disconnect();
@@ -7040,6 +7926,7 @@ class IPCHandlers {
       const connectOpts = {
         model: options.model,
         language: options.language,
+        mode: options.mode,
         preconfigured: options.mode !== "byok",
         environment: options.environment,
         tenant: options.tenant,
@@ -7153,7 +8040,7 @@ class IPCHandlers {
     let meetingMicDiarizationPath = null;
     let meetingMicDiarizationStartedAt = null;
     let meetingSystemAudioHeard = false;
-    let meetingSystemAudioDegraded = false;
+    const meetingSystemAudioHandover = createMeetingSystemAudioHandover();
     let meetingDiarizationSegments = [];
     let meetingLiveSpeakerActive = false;
     let meetingLiveSpeakerState = null;
@@ -7176,6 +8063,8 @@ class IPCHandlers {
     let meetingOneOnOneAttendee = null;
     let meetingOneOnOneProfileBound = false;
     let meetingNoteId = null;
+    // First speaker index this session may mint; past a resumed note's ids.
+    let meetingSpeakerIndexBase = 0;
 
     const getLiveSpeakerProfiles = () => {
       const attendees = this._getNoteNonSelfParticipants(meetingNoteId);
@@ -7325,6 +8214,9 @@ class IPCHandlers {
 
     const startMeetingAec = async (systemAudioMode) => {
       meetingAecEnabled = false;
+      if (meetingConnectionOptions.aecEnabled !== true) {
+        return false;
+      }
       if (systemAudioMode === "unsupported" || !this.meetingAecManager?.isAvailable()) {
         return false;
       }
@@ -7486,6 +8378,7 @@ class IPCHandlers {
             getSpeakerProfiles: getLiveSpeakerProfiles,
             maxSpeakers: resolveSessionMaxSpeakers(),
             enabled: true,
+            speakerIndexBase: meetingSpeakerIndexBase,
           }
         )
         .catch((error) => {
@@ -7745,6 +8638,7 @@ class IPCHandlers {
       meetingOneOnOneAttendee = null;
       meetingOneOnOneProfileBound = false;
       meetingNoteId = null;
+      meetingSpeakerIndexBase = 0;
       this._activeMeetingNoteId = null;
       meetingLocalMode = false;
       meetingLocalBuffers = { mic: [], system: [] };
@@ -7759,7 +8653,7 @@ class IPCHandlers {
       meetingDiarizationStartedAt = null;
       dropMeetingMicDiarizationCapture();
       meetingSystemAudioHeard = false;
-      meetingSystemAudioDegraded = false;
+      meetingSystemAudioHandover.reset();
       meetingDiarizationSegments = [];
       meetingLocalWin = null;
       meetingLocalTranscript = "";
@@ -7837,6 +8731,10 @@ class IPCHandlers {
       if (dictationPreviewTranscribing) return;
       if (!dictationPreviewBuffer.length) return;
 
+      const gen = dictationPreviewGen;
+      const provider = dictationPreviewProvider;
+      const model = dictationPreviewModel;
+      const language = dictationPreviewLanguage;
       dictationPreviewTranscribing = true;
       try {
         const pcm = Buffer.concat(dictationPreviewBuffer);
@@ -7859,35 +8757,37 @@ class IPCHandlers {
         const wav = pcm16ToWav(pcm);
 
         let result;
-        if (isSherpaLocalProvider(dictationPreviewProvider)) {
+        if (isSherpaLocalProvider(provider)) {
           result = await this.parakeetManager.transcribeLocalParakeet(wav, {
-            model: dictationPreviewModel,
-            language: dictationPreviewLanguage,
+            model,
+            language,
           });
         } else {
           const vadOptions = this._resolveWhisperVadOptions("dictation");
           result = await this.whisperManager.transcribeLocalWhisper(wav, {
-            model: dictationPreviewModel,
-            language: dictationPreviewLanguage,
+            model,
+            language,
             ...vadOptions,
           });
         }
 
+        if (gen !== dictationPreviewGen) return;
         if (result?.success && result.text?.trim()) {
           this.windowManager.appendTranscriptionPreview(result.text.trim());
         } else if (result && !result.success) {
           debugLogger.warn("Dictation preview chunk returned failure", {
             error: result.error || result.message,
-            provider: dictationPreviewProvider,
+            provider,
           });
         }
       } catch (error) {
+        if (gen !== dictationPreviewGen) return;
         debugLogger.error("Dictation preview transcription chunk failed", {
           error: error.message,
-          provider: dictationPreviewProvider,
+          provider,
         });
       } finally {
-        dictationPreviewTranscribing = false;
+        if (gen === dictationPreviewGen) dictationPreviewTranscribing = false;
       }
     };
 
@@ -8008,14 +8908,31 @@ class IPCHandlers {
     };
 
     const setupDictationCallbacks = (streaming, event) => {
+      const isOrukeet = streaming instanceof OrukeetStreaming;
+      const canNotify = () =>
+        !isOrukeet || (this._dictationStreaming === streaming && !event.sender.isDestroyed?.());
+      if (isOrukeet) {
+        const ownerGone = () => {
+          streaming.disconnect().catch(() => {});
+          if (this._dictationStreaming === streaming) this._dictationStreaming = null;
+        };
+        event.sender.once?.("destroyed", ownerGone);
+        streaming.onClose = () => event.sender.removeListener?.("destroyed", ownerGone);
+      }
       streaming.onPartialTranscript = (text) => {
         event.sender.send("dictation-realtime-partial", text);
         if (this._dictationPreviewEnabled && text) {
           this.windowManager.showTranscriptionPreview(text);
         }
       };
-      streaming.onFinalTranscript = (text) => event.sender.send("dictation-realtime-final", text);
+      streaming.onFinalTranscript = (text) => {
+        if (canNotify()) event.sender.send("dictation-realtime-final", text);
+      };
+      streaming.onLanguage = (metadata) => {
+        if (canNotify()) event.sender.send("dictation-realtime-language", metadata);
+      };
       streaming.onError = (err) => {
+        if (!canNotify()) return;
         event.sender.send("dictation-realtime-error", err.message);
         if (this._dictationPreviewEnabled) this.windowManager.hideTranscriptionPreview();
       };
@@ -8025,7 +8942,18 @@ class IPCHandlers {
       };
     };
 
+    // A session being replaced must go quiet: a late final or socket error from
+    // it would land in the renderer as if it came from the live session.
+    const retireDictationStreaming = (streaming) => {
+      streaming.onPartialTranscript = null;
+      streaming.onFinalTranscript = null;
+      streaming.onError = null;
+      streaming.onSessionEnd = null;
+      streaming.disconnect({ commit: false }).catch(() => {});
+    };
+
     const DICTATION_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+    const ORUKEET_IDLE_TIMEOUT_MS = 60 * 1000;
 
     const clearDictationIdleTimer = () => {
       if (this._dictationIdleTimer) {
@@ -8036,13 +8964,38 @@ class IPCHandlers {
 
     const startDictationIdleTimer = () => {
       clearDictationIdleTimer();
+      const idleTimeoutMs =
+        this._dictationStreaming instanceof OrukeetStreaming
+          ? ORUKEET_IDLE_TIMEOUT_MS
+          : DICTATION_IDLE_TIMEOUT_MS;
       this._dictationIdleTimer = setTimeout(() => {
         if (this._dictationStreaming) {
           debugLogger.debug("Closing idle dictation warmup connection");
           this._dictationStreaming.disconnect().catch(() => {});
           this._dictationStreaming = null;
         }
-      }, DICTATION_IDLE_TIMEOUT_MS);
+      }, idleTimeoutMs);
+    };
+
+    // What a dictation connection was opened for; a start or warmup reuses one
+    // only when nothing about the route changed and, for a connection that reads
+    // a saved key, no key was saved since. OpenAI pins the language when the
+    // session is configured (BYOK session.update, or the cloud token request), so
+    // it is part of that route; the other providers never send it at connect.
+    const dictationConnectionKey = (options) => {
+      const provider = options.provider || "openai-realtime";
+      const readsSavedKey = options.mode === "byok" || provider === "tinfoil-realtime";
+      return JSON.stringify([
+        provider,
+        options.mode,
+        options.model,
+        options.baseUrl,
+        options.pipelineOptions,
+        readsSavedKey ? credentialGeneration : null,
+        provider === "openai-realtime"
+          ? OpenAIRealtimeStreaming.normalizeLanguage(options.language)
+          : null,
+      ]);
     };
 
     const connectDictationStreaming = async (event, options) => {
@@ -8061,8 +9014,13 @@ class IPCHandlers {
       clearDictationIdleTimer();
       this._dictationPreviewEnabled = !!options.preview;
 
+      // The renderer is already streaming frames when a start redials (it wires
+      // the worklet before calling start), so the old session is retired without
+      // a wait, and without a commit where the client supports skipping it: a
+      // commit would only surface its head as a final from the wrong session.
+      // Frames that reached the old session before the start are dropped with it.
       if (this._dictationStreaming) {
-        await this._dictationStreaming.disconnect().catch(() => {});
+        retireDictationStreaming(this._dictationStreaming);
         this._dictationStreaming = null;
       }
 
@@ -8072,17 +9030,45 @@ class IPCHandlers {
         // default lives here, at the boundary, so the token allowlist stays
         // fail-closed for genuinely unknown providers (#1624).
         const provider = options.provider ?? "openai-realtime";
-        const streaming = new OpenAIRealtimeStreaming();
+        const streaming =
+          provider === "orukeet"
+            ? new OrukeetStreaming(isCloud ? MANAGED_STREAM_OPTIONS : {})
+            : new OpenAIRealtimeStreaming();
+        if (provider === "orukeet")
+          streaming.onUsageError = (metadata) =>
+            debugLogger.error("Combined cleanup usage could not be recorded", metadata);
         setupDictationCallbacks(streaming, event);
         // Assign before the token fetch (a real network round trip) so
         // dictation-realtime-send has a live instance to buffer into instead
         // of silently dropping the start of the recording.
         streaming.beginConnecting();
+        streaming.connectionKey = dictationConnectionKey(options);
         this._dictationStreaming = streaming;
         try {
+          if (provider === "orukeet") {
+            if (isCloud) {
+              await connectManagedOrukeet({
+                streaming,
+                getApiUrl,
+                proxyFetch,
+                tokenStore,
+                withPolicyHeaders,
+                pipelineOptions: options.pipelineOptions,
+              });
+            } else {
+              await streaming.connect({
+                apiKey: this.environmentManager.getCustomTranscriptionKey(),
+                baseUrl: options.baseUrl,
+              });
+            }
+            return;
+          }
           const apiKey = await fetchRealtimeToken(event, {
             mode: options.mode,
             provider,
+            // Cloud sessions are configured server-side when the secret is minted;
+            // the server also owns the managed model, so only the language is sent.
+            language: OpenAIRealtimeStreaming.normalizeLanguage(options.language) ?? undefined,
           });
           if (provider === "tinfoil-realtime") {
             const model = options.model || TINFOIL_REALTIME_MODEL;
@@ -8097,12 +9083,14 @@ class IPCHandlers {
             await streaming.connect({
               apiKey,
               model: options.model || "gpt-4o-mini-transcribe",
+              language: options.language,
               // OpenAI rejects rates below 24kHz; the 16kHz capture is upsampled instead.
               captureRate: 16000,
               preconfigured: isCloud,
             });
           }
         } catch (err) {
+          if (provider === "orukeet") await streaming.disconnect().catch(() => {});
           if (this._dictationStreaming === streaming) this._dictationStreaming = null;
           throw err;
         }
@@ -8132,7 +9120,7 @@ class IPCHandlers {
       }
 
       const { mode: systemAudioMode } = await getMeetingSystemAudioPlan();
-      const requestedConnectionKey = getMeetingConnectionKey(options);
+      const requestedConnectionKey = getMeetingConnectionKey(options, credentialGeneration);
 
       if (
         isMeetingStreamingConnected(systemAudioMode) &&
@@ -8211,6 +9199,7 @@ class IPCHandlers {
           sessionId: recordingSessionId,
           autoEndEligible: options.autoEndEligible === true,
           ownerWebContents: event.sender,
+          noteId: options.noteId ?? null,
           // Renderer loopback may still fail after main chooses its strategy.
           // Auto-end stays fail-safe until the renderer confirms a real source.
           systemAudioAvailable: false,
@@ -8222,17 +9211,25 @@ class IPCHandlers {
           armMeetingSystemAudioSilenceTimer(meetingConnectionWin, result.systemAudioStrategy);
           startMeetingSystemAudioWatchdog(meetingConnectionWin, result.systemAudioStrategy);
         }
-        return { ...result, sessionId: recordingSessionId };
+        return {
+          ...result,
+          sessionId: recordingSessionId,
+          speakerIndexBase: meetingSpeakerIndexBase,
+        };
       };
 
       try {
         const systemAudioPlan = await getMeetingSystemAudioPlan({ refreshWindowsCapability: true });
         let { mode: systemAudioMode, strategy: systemAudioStrategy } = systemAudioPlan;
-        const requestedConnectionKey = getMeetingConnectionKey(options);
+        const requestedConnectionKey = getMeetingConnectionKey(options, credentialGeneration);
         meetingEchoLeakDetector.reset();
         meetingOneOnOneAttendee = resolveOneOnOneAttendeeForNote(options.noteId);
         meetingOneOnOneProfileBound = false;
         meetingNoteId = options.noteId ?? null;
+        meetingSpeakerIndexBase = this._resolveMeetingSpeakerIndexBase(
+          meetingNoteId,
+          options.speakerIndexBase
+        );
         this._activeMeetingNoteId = meetingNoteId;
 
         // Seed the speaker cap from the note/calendar participants up front so live
@@ -8438,22 +9435,26 @@ class IPCHandlers {
     };
 
     // The Windows helper reports capture_silent when its own stream is silent
-    // while a render endpoint is playing: activation succeeded but no audio
-    // will ever arrive, so hand the live session to Chromium's renderer
-    // loopback. The silence watchdog stays armed in case that fails too.
-    const degradeMeetingSystemAudioToLoopback = async (event) => {
-      if (meetingSystemAudioDegraded || meetingSystemAudioHeard) return;
-      meetingSystemAudioDegraded = true;
+    // while a render endpoint is playing, which activation success cannot
+    // detect. Start renderer loopback beside it; the handover decides whether
+    // it takes the channel.
+    const degradeMeetingSystemAudioToLoopback = (event) => {
+      if (!meetingSystemAudioHandover.begin()) return;
       debugLogger.warn(
-        "Windows system audio helper captured only silence, switching to renderer loopback",
+        "Windows system audio helper captured only silence, starting renderer loopback beside it",
         {},
         "meeting"
       );
-      await this.windowsLoopbackAudioManager?.stop().catch(() => {});
       const win = BrowserWindow.fromWebContents(event.sender);
       if (win && !win.isDestroyed()) {
         win.webContents.send("meeting-system-audio-degraded");
       }
+    };
+
+    const completeMeetingSystemAudioHandover = () => {
+      debugLogger.info("Renderer loopback took over system audio capture", {}, "meeting");
+      meetingSystemAudioWatchdog.detachCapture();
+      void this.windowsLoopbackAudioManager?.stop().catch(() => {});
     };
 
     const startManagedMeetingSystemAudio = (event, manager, warningLabel, onWarningCode) => {
@@ -8466,6 +9467,7 @@ class IPCHandlers {
         captureStarted = true;
         return manager.start({
           onChunk: (chunk) => {
+            if (!meetingSystemAudioHandover.acceptNativeChunk(chunk)) return;
             if (timeline) {
               timeline.write(chunk, (buffer, synthetic, capturedAt) =>
                 sendMeetingAudio(buffer, "system", synthetic, capturedAt)
@@ -8556,7 +9558,7 @@ class IPCHandlers {
             "Windows system audio warning",
             (code) => {
               if (code === "capture_silent") {
-                void degradeMeetingSystemAudioToLoopback(event);
+                degradeMeetingSystemAudioToLoopback(event);
               }
             }
           );
@@ -8596,7 +9598,13 @@ class IPCHandlers {
     };
 
     ipcMain.on("meeting-transcription-send", (_event, audioBuffer, source) => {
-      sendMeetingAudio(audioBuffer, source);
+      const buffer = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
+      if (source === "system") {
+        const route = meetingSystemAudioHandover.acceptRendererChunk(buffer);
+        if (route === "drop") return;
+        if (route === "takeover") completeMeetingSystemAudioHandover();
+      }
+      sendMeetingAudio(buffer, source);
     });
 
     const stopMeetingTranscription = async (expectedSessionId) => {
@@ -8645,6 +9653,7 @@ class IPCHandlers {
             buildOrderedTranscriptText(diarizationSegments) || meetingLocalTranscript;
           const sessionSpeakerConfigSnapshot = this.activeMeetingSpeakerConfig;
           const noteIdSnapshot = meetingNoteId;
+          const speakerIndexBaseSnapshot = meetingSpeakerIndexBase;
           this.activeMeetingSpeakerConfig = null;
           resetMeetingLocalState();
 
@@ -8658,7 +9667,8 @@ class IPCHandlers {
             liveSpeakerState,
             sessionSpeakerConfigSnapshot,
             noteIdSnapshot,
-            diarizedSource
+            diarizedSource,
+            speakerIndexBaseSnapshot
           );
 
           return { success: true, transcript, diarizationSessionId };
@@ -8673,6 +9683,7 @@ class IPCHandlers {
 
         const sessionSpeakerConfigSnapshot = this.activeMeetingSpeakerConfig;
         const noteIdSnapshot = meetingNoteId;
+        const speakerIndexBaseSnapshot = meetingSpeakerIndexBase;
         this.activeMeetingSpeakerConfig = null;
 
         // Fire-and-forget background diarization (or notify skip)
@@ -8685,7 +9696,8 @@ class IPCHandlers {
           liveSpeakerState,
           sessionSpeakerConfigSnapshot,
           noteIdSnapshot,
-          diarizedSource
+          diarizedSource,
+          speakerIndexBaseSnapshot
         );
 
         return { success: true, transcript, diarizationSessionId };
@@ -8743,21 +9755,48 @@ class IPCHandlers {
       return result;
     };
 
-    ipcMain.handle("dictation-realtime-warmup", async (event, options = {}) => {
-      try {
+    // Every managed Orukeet connection spends a single-use GPU token, and both
+    // post-dictation re-warm paths fire together. Warmups run one at a time so
+    // the second finds the first's fresh socket and reuses it rather than
+    // discarding it and minting another.
+    const isUnusedOrukeetConnection = (streaming, options) =>
+      streaming instanceof OrukeetStreaming &&
+      streaming.isConnected &&
+      !streaming.failure &&
+      !streaming.finalPromise &&
+      streaming.audioBytesSent === 0 &&
+      streaming.connectionKey === dictationConnectionKey(options);
+
+    const warmupDictationStreaming = async (event, options) => {
+      await this._dictationConnectPromise?.catch(() => {});
+      if (!isUnusedOrukeetConnection(this._dictationStreaming, options)) {
         await connectDictationStreaming(event, options);
         startDictationIdleTimer();
         return { success: true };
-      } catch (err) {
-        return streamingStartFailure(err);
       }
+      startDictationIdleTimer();
+      return { success: true, alreadyWarm: true };
+    };
+
+    let dictationWarmupQueue = Promise.resolve();
+    ipcMain.handle("dictation-realtime-warmup", (event, options = {}) => {
+      const warmup = dictationWarmupQueue
+        .then(() => warmupDictationStreaming(event, options))
+        .catch(streamingStartFailure);
+      dictationWarmupQueue = warmup;
+      return warmup;
     });
 
     ipcMain.handle("dictation-realtime-start", async (event, options = {}) => {
       try {
         clearDictationIdleTimer();
         this._dictationPreviewEnabled = !!options.preview;
-        if (!this._dictationStreaming?.isConnected) await connectDictationStreaming(event, options);
+        if (
+          !this._dictationStreaming?.isConnected ||
+          this._dictationStreaming.connectionKey !== dictationConnectionKey(options)
+        ) {
+          await connectDictationStreaming(event, options);
+        }
         return { success: true };
       } catch (err) {
         return streamingStartFailure(err);
@@ -8766,6 +9805,17 @@ class IPCHandlers {
 
     ipcMain.on("dictation-realtime-send", (_event, buffer) => {
       this._dictationStreaming?.sendAudio(Buffer.from(buffer));
+    });
+
+    ipcMain.handle("dictation-realtime-finalize", async () => {
+      if (!(this._dictationStreaming instanceof OrukeetStreaming)) {
+        return { success: false, error: "No Orukeet recording is active" };
+      }
+      try {
+        return { success: true, ...(await this._dictationStreaming.finalize()) };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
     });
 
     ipcMain.handle("dictation-realtime-stop", async () => {
@@ -8779,7 +9829,7 @@ class IPCHandlers {
         this.windowManager.hideTranscriptionPreview();
         this._dictationPreviewEnabled = false;
       }
-      return { success: true, text: result.text || "" };
+      return { success: true, ...result, text: result.text || "" };
     });
 
     ipcMain.handle(
@@ -8937,9 +9987,10 @@ class IPCHandlers {
         if (streamedText && display && dictationPreviewSessionActive) {
           this.windowManager.showTranscriptionPreview(streamedText);
         }
-      } else {
-        await transcribeDictationPreviewChunk();
       }
+      // Offline chunks only draw previews. The renderer decodes the full
+      // recording separately, so another preview decode here competes with
+      // final transcription without contributing to its result.
       resetDictationPreviewState({ preserveSession: display });
       if (!display || !dictationPreviewSessionActive) {
         return { success: true, streamed, text: streamedText };
@@ -9004,6 +10055,7 @@ class IPCHandlers {
             systemPrompt: opts.systemPrompt,
             requestPurpose: opts.requestPurpose,
             promptMode: opts.promptMode,
+            purpose: opts.purpose,
             screenContext: opts.screenContext,
             language: opts.language,
             locale: opts.locale,
@@ -9011,11 +10063,18 @@ class IPCHandlers {
             clientType: "desktop",
             appVersion: app.getVersion(),
             clientVersion: app.getVersion(),
+            streamingFallbackReason: opts.streamingFallbackReason,
             sttProvider: opts.sttProvider,
             sttModel: opts.sttModel,
             sttProcessingMs: opts.sttProcessingMs,
             sttWordCount: opts.sttWordCount,
             sttLanguage: opts.sttLanguage,
+            sttDetectedLanguage: opts.sttDetectedLanguage,
+            sttDetectedLanguageConfidence: opts.sttDetectedLanguageConfidence,
+            sttDetectedLanguageAudioSeconds: opts.sttDetectedLanguageAudioSeconds,
+            sttDetectedLanguageStatus: opts.sttDetectedLanguageStatus,
+            orukeetLanguageRouting: opts.orukeetLanguageRouting,
+            orukeetCleanup: opts.orukeetCleanup,
             audioDurationMs: opts.audioDurationMs,
             audioSizeBytes: opts.audioSizeBytes,
             audioFormat: opts.audioFormat,
@@ -9259,6 +10318,12 @@ class IPCHandlers {
               sttModel: opts.sttModel,
               sttProcessingMs: opts.sttProcessingMs,
               sttLanguage: opts.sttLanguage,
+              sttDetectedLanguage: opts.sttDetectedLanguage,
+              sttDetectedLanguageConfidence: opts.sttDetectedLanguageConfidence,
+              sttDetectedLanguageAudioSeconds: opts.sttDetectedLanguageAudioSeconds,
+              sttDetectedLanguageStatus: opts.sttDetectedLanguageStatus,
+              orukeetLanguageRouting: opts.orukeetLanguageRouting,
+              orukeetCleanup: opts.orukeetCleanup,
               audioSizeBytes: opts.audioSizeBytes,
               audioFormat: opts.audioFormat,
               clientTotalMs: opts.clientTotalMs,
@@ -9467,6 +10532,7 @@ class IPCHandlers {
     ipcMain.handle("transcribe-audio-file-cloud", async (event, filePath, opts = {}) => {
       const requestId = typeof opts?.requestId === "string" ? opts.requestId : null;
       const { signal, release } = this._uploadCancelRegistry.register(requestId);
+      let cleanupUpload = null;
       try {
         if (typeof filePath !== "string") {
           return { success: false, error: "Invalid file path" };
@@ -9510,15 +10576,12 @@ class IPCHandlers {
           };
         }
 
-        const audioBuffer = fs.readFileSync(realCloud);
-        const ext = path.extname(realCloud).toLowerCase().replace(".", "");
-        const contentType = AUDIO_MIME_TYPES[ext] || "audio/mpeg";
-        const fileName = path.basename(realCloud);
-
+        const upload = await prepareProviderUpload(realCloud, { signal });
+        cleanupUpload = upload.cleanup;
         const { body, boundary } = buildMultipartBody(
-          audioBuffer,
-          fileName,
-          contentType,
+          fs.readFileSync(upload.path),
+          path.basename(upload.path),
+          providerContentType(upload.path),
           multipartFields
         );
         const url = new URL(`${apiUrl}/api/transcribe`);
@@ -9540,6 +10603,7 @@ class IPCHandlers {
         debugLogger.error("Cloud audio file transcription error", { error: error.message });
         return toPolicyFailure(error);
       } finally {
+        cleanupUpload?.();
         release();
       }
     });
@@ -9572,12 +10636,14 @@ class IPCHandlers {
         }
       ) => {
         const fs = require("fs");
+        let cleanupUpload = null;
+        let providerErrorContext = null;
         try {
           if (typeof filePath !== "string") {
             return { success: false, error: "Invalid file path" };
           }
-          const realByok = resolveAllowedAudioPath(filePath);
-          if (!realByok) return { success: false, error: "File path not allowed" };
+          const sourcePath = resolveAllowedAudioPath(filePath);
+          if (!sourcePath) return { success: false, error: "File path not allowed" };
 
           const { resolveTranscriptionRoute } = await import("./transcriptionRoute.ts");
           const route = resolveTranscriptionRoute({
@@ -9606,35 +10672,49 @@ class IPCHandlers {
             };
           }
 
+          const upload = await prepareProviderUpload(sourcePath);
+          cleanupUpload = upload.cleanup;
+          const realByok = upload.path;
+
           if (route.transport === "managed") {
             if (fs.statSync(realByok).size > route.sizeCapBytes) {
               return { success: false, error: byokSizeCapError(route.sizeCapBytes) };
             }
-            const ext = path.extname(realByok).toLowerCase().replace(".", "");
             const text = await this.executeManagedTranscription(event, route, {
               audioBuffer: fs.readFileSync(realByok),
               fileName: path.basename(realByok),
-              contentType: AUDIO_MIME_TYPES[ext] || "audio/mpeg",
+              contentType: providerContentType(realByok),
             });
             return { success: true, text };
           }
 
+          // Every branch below calls a BYOK provider or the user's own server.
+          providerErrorContext = {
+            provider: transcriptionProviderName(route.provider),
+            selfHosted: route.provider === "self-hosted" || route.provider === "custom",
+            model: route.model,
+            surface: "transcription",
+          };
+
           if (route.transport === "http-batch" && route.provider === "self-hosted") {
             // User's own server, so the 25 MB third-party cap does not apply.
-            const ext = path.extname(realByok).toLowerCase().replace(".", "");
             const { body, boundary } = buildMultipartBody(
               fs.readFileSync(realByok),
               path.basename(realByok),
-              AUDIO_MIME_TYPES[ext] || "audio/mpeg",
+              providerContentType(realByok),
               { model: route.model, language: route.language }
             );
             const data = await postMultipart(new URL(route.endpoint), body, boundary);
             if (data.statusCode !== 200) {
-              throw new Error(
-                data.data?.error?.message ||
-                  data.data?.error ||
-                  `Self-hosted API Error: ${data.statusCode}`
-              );
+              debugLogger.warn("Self-hosted file transcription failed", {
+                status: data.statusCode,
+                body: redactProviderBody(data.data),
+              });
+              throw providerHttpError({
+                ...providerErrorContext,
+                status: data.statusCode,
+                body: data.data,
+              });
             }
             return { success: true, text: data.data.text };
           }
@@ -9648,7 +10728,10 @@ class IPCHandlers {
             const clientId = this.environmentManager.getCortiClientId();
             const clientSecret = this.environmentManager.getCortiClientSecret();
             if (!clientId || !clientSecret) {
-              throw new Error("Corti credentials not configured. Add them in Settings.");
+              throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+                provider: "Corti",
+                surface: "transcription",
+              });
             }
             const { transcribeAudio } = require("./cortiTranscription");
             const { text } = await transcribeAudio({
@@ -9663,11 +10746,10 @@ class IPCHandlers {
           }
 
           if (route.transport === "proxied" && route.provider === "tinfoil") {
-            const ext = path.extname(realByok).toLowerCase().replace(".", "");
             const { text } = await transcribeWithTinfoil({
               audioBuffer: fs.readFileSync(realByok),
               fileName: path.basename(realByok),
-              contentType: AUDIO_MIME_TYPES[ext] || "audio/mpeg",
+              contentType: providerContentType(realByok),
               language: route.language,
               apiKey: this.environmentManager.getTinfoilKey(),
             });
@@ -9675,25 +10757,26 @@ class IPCHandlers {
           }
 
           if (route.transport === "proxied" && route.provider === "gemini") {
-            const ext = path.extname(realByok).toLowerCase().replace(".", "");
             // Deliberately no language hint — same rationale as the multipart
             // branch below, and Gemini's language_codes is a hard constraint.
             const { text } = await transcribeWithGemini({
               audioBuffer: fs.readFileSync(realByok),
               model: route.model,
-              contentType: AUDIO_MIME_TYPES[ext] || "audio/mpeg",
+              contentType: providerContentType(realByok),
               apiKey: apiKey || this.environmentManager.getGeminiKey(),
             });
             return { success: true, text };
           }
 
           if (!apiKey && route.provider !== "custom") {
-            throw new Error("No API key configured. Add your key in Settings.");
+            throw providerError(PROVIDER_ERROR_CODES.KEY_MISSING, {
+              provider: transcriptionProviderName(route.provider),
+              surface: "transcription",
+            });
           }
 
           const audioBuffer = fs.readFileSync(realByok);
-          const ext = path.extname(realByok).toLowerCase().replace(".", "");
-          const contentType = AUDIO_MIME_TYPES[ext] || "audio/mpeg";
+          const contentType = providerContentType(realByok);
           const fileName = path.basename(realByok);
 
           // mistral/xai have no OpenAI-compatible endpoint — talk to them
@@ -9761,16 +10844,17 @@ class IPCHandlers {
             : undefined;
           const data = await postMultipart(url, body, boundary, headers);
 
-          if (data.statusCode === 401) {
-            return { success: false, error: "Invalid API key. Check your key in Settings." };
-          }
-          if (data.statusCode === 429) {
-            return { success: false, error: "Rate limit exceeded. Please try again later." };
-          }
           if (data.statusCode !== 200) {
-            throw new Error(
-              data.data?.error?.message || data.data?.error || `API error: ${data.statusCode}`
-            );
+            debugLogger.warn("BYOK file transcription failed", {
+              provider: route.provider,
+              status: data.statusCode,
+              body: redactProviderBody(data.data),
+            });
+            throw providerHttpError({
+              ...providerErrorContext,
+              status: data.statusCode,
+              body: data.data,
+            });
           }
 
           if (diarize && data.data?.speakers) {
@@ -9810,14 +10894,14 @@ class IPCHandlers {
           }
           const segments = timestamps ? mapVerboseSegments(data.data) : null;
           return { success: true, text: data.data.text, ...(segments ? { segments } : {}) };
-        } catch (error) {
+        } catch (rawError) {
+          const error = providerErrorContext
+            ? asProviderError(rawError, providerErrorContext)
+            : rawError;
           debugLogger.error("BYOK audio file transcription error", { error: error.message });
-          return {
-            success: false,
-            error: error.message,
-            code: error.code,
-            messageKey: error.messageKey,
-          };
+          return { success: false, ...ipcErrorFields(error) };
+        } finally {
+          cleanupUpload?.();
         }
       }
     );
@@ -10100,6 +11184,11 @@ class IPCHandlers {
       return this.updateManager.getUpdateInfo();
     });
 
+    ipcMain.handle("set-auto-updates-enabled", async (_event, enabled) => {
+      this.updateManager.setAutoUpdatesEnabled(enabled === true);
+      return { success: true };
+    });
+
     const fetchStreamingToken = async (event) => {
       const apiUrl = getApiUrl();
       if (!apiUrl) {
@@ -10138,29 +11227,64 @@ class IPCHandlers {
       return token;
     };
 
+    // BYOK dictation mints through the shared realtime-token table instead of the
+    // account-scoped server endpoint, so it needs neither an API URL nor a
+    // session. The client's token cache is deliberately bypassed on that path:
+    // AssemblyAI's BYOK grant lives 60 seconds against a 5-minute cache window,
+    // and a cache shared across modes would replay a managed token as a BYOK one.
+    const fetchAssemblyAiToken = (event, byok) =>
+      byok
+        ? fetchRealtimeToken(event, { mode: "byok", provider: "assemblyai-realtime" })
+        : fetchStreamingToken(event);
+
+    // A warm socket opened before the latest key save still carries the old key;
+    // dropping it sends the start out on a fresh connect with the new one. Starts
+    // check right before connecting, because a warmup that was still minting can
+    // open its socket during the start's own token fetch.
+    const dropStaleWarmConnection = (streaming) => {
+      if (streaming.warmConnectionOptions?.credentialGeneration !== credentialGeneration) {
+        streaming.cleanupWarmConnection();
+      }
+    };
+
+    // A warmup replaces a stale ready socket instead of reporting it warm, so the
+    // next start finds one with the new key. A socket still opening is left to the
+    // start: closing it mid-handshake would fail the warmup that opened it.
+    const dropStaleReadyWarmConnection = (streaming) => {
+      if (streaming.hasWarmConnection()) dropStaleWarmConnection(streaming);
+    };
+
     ipcMain.handle("assemblyai-streaming-warmup", async (event, options = {}) => {
       try {
-        const apiUrl = getApiUrl();
-        if (!apiUrl) {
+        const byok = options.mode === "byok";
+        if (!byok && !getApiUrl()) {
           return { success: false, error: "API not configured", code: "NO_API" };
         }
 
         if (!this.assemblyAiStreaming) {
           this.assemblyAiStreaming = new AssemblyAiStreaming();
         }
+        this.assemblyAiStreaming.adoptMode(options);
+        if (byok) dropStaleReadyWarmConnection(this.assemblyAiStreaming);
 
         if (this.assemblyAiStreaming.hasWarmConnection()) {
           debugLogger.debug("AssemblyAI connection already warm", {}, "streaming");
           return { success: true, alreadyWarm: true };
         }
 
-        let token = this.assemblyAiStreaming.getCachedToken();
+        // Read before the key is, so a save during the mint marks this socket stale.
+        const generation = credentialGeneration;
+        let token = byok ? null : this.assemblyAiStreaming.getCachedToken();
         if (!token) {
-          debugLogger.debug("Fetching new streaming token for warmup", {}, "streaming");
-          token = await fetchStreamingToken(event);
+          debugLogger.debug("Fetching new streaming token for warmup", { byok }, "streaming");
+          token = await fetchAssemblyAiToken(event, byok);
         }
 
-        await this.assemblyAiStreaming.warmup({ ...options, token });
+        await this.assemblyAiStreaming.warmup({
+          ...options,
+          token,
+          credentialGeneration: generation,
+        });
         debugLogger.debug("AssemblyAI connection warmed up", {}, "streaming");
 
         return { success: true };
@@ -10180,8 +11304,8 @@ class IPCHandlers {
 
       streamingStartInProgress = true;
       try {
-        const apiUrl = getApiUrl();
-        if (!apiUrl) {
+        const byok = options.mode === "byok";
+        if (!byok && !getApiUrl()) {
           return { success: false, error: "API not configured", code: "NO_API" };
         }
 
@@ -10190,6 +11314,7 @@ class IPCHandlers {
         if (!this.assemblyAiStreaming) {
           this.assemblyAiStreaming = new AssemblyAiStreaming();
         }
+        this.assemblyAiStreaming.adoptMode(options);
 
         // Clean up any stale active connection (shouldn't happen normally)
         if (this.assemblyAiStreaming.isConnected) {
@@ -10208,11 +11333,15 @@ class IPCHandlers {
           "streaming"
         );
 
-        let token = this.assemblyAiStreaming.getCachedToken();
+        // Buffer before the token fetch (a network round trip for BYOK, even when
+        // a warm socket will carry the session) so assemblyai-streaming-send has
+        // somewhere to put the first frames.
+        this.assemblyAiStreaming.beginConnecting();
+        let token = byok ? null : this.assemblyAiStreaming.getCachedToken();
         if (!token) {
-          debugLogger.debug("Fetching streaming token from API", {}, "streaming");
-          token = await fetchStreamingToken(event);
-          this.assemblyAiStreaming.cacheToken(token);
+          debugLogger.debug("Fetching streaming token", { byok }, "streaming");
+          token = await fetchAssemblyAiToken(event, byok);
+          if (!byok) this.assemblyAiStreaming.cacheToken(token);
         } else {
           debugLogger.debug("Using cached streaming token", {}, "streaming");
         }
@@ -10242,6 +11371,7 @@ class IPCHandlers {
           }
         };
 
+        if (byok) dropStaleWarmConnection(this.assemblyAiStreaming);
         await this.assemblyAiStreaming.connect({ ...options, token });
         debugLogger.debug("AssemblyAI streaming started", {}, "streaming");
 
@@ -10251,6 +11381,8 @@ class IPCHandlers {
         };
       } catch (error) {
         debugLogger.error("AssemblyAI streaming start error", { error: error.message });
+        // Nothing is in flight after a failed start, so its held audio goes too.
+        this.assemblyAiStreaming?.cleanup();
         if (error.code === "AUTH_EXPIRED") {
           return { success: false, error: "Session expired", code: "AUTH_EXPIRED" };
         }
@@ -10369,10 +11501,26 @@ class IPCHandlers {
       return token;
     };
 
+    // Same BYOK contract as AssemblyAI above, except the "token" is the raw
+    // long-lived Deepgram key. It still bypasses the client cache so a token
+    // minted in one mode can never be replayed in the other.
+    const DEEPGRAM_BYOK_TOKEN_OPTIONS = { mode: "byok", provider: "deepgram-realtime" };
+    const fetchDeepgramToken = (event, byok) =>
+      byok
+        ? fetchRealtimeToken(event, DEEPGRAM_BYOK_TOKEN_OPTIONS)
+        : fetchDeepgramStreamingToken(event);
+    const setDeepgramTokenRefreshFn = (event, byok) => {
+      this.deepgramStreaming.setTokenRefreshFn(async () => {
+        if (byok) return fetchRealtimeToken(event, DEEPGRAM_BYOK_TOKEN_OPTIONS);
+        if (!deepgramTokenWindowId) throw new Error("No window reference");
+        return fetchDeepgramStreamingTokenFromWindow(deepgramTokenWindowId);
+      });
+    };
+
     ipcMain.handle("deepgram-streaming-warmup", async (event, options = {}) => {
       try {
-        const apiUrl = getApiUrl();
-        if (!apiUrl) {
+        const byok = options.mode === "byok";
+        if (!byok && !getApiUrl()) {
           return { success: false, error: "API not configured", code: "NO_API" };
         }
 
@@ -10384,24 +11532,32 @@ class IPCHandlers {
         if (!this.deepgramStreaming) {
           this.deepgramStreaming = new DeepgramStreaming();
         }
+        this.deepgramStreaming.adoptMode(options);
 
-        this.deepgramStreaming.setTokenRefreshFn(async () => {
-          if (!deepgramTokenWindowId) throw new Error("No window reference");
-          return fetchDeepgramStreamingTokenFromWindow(deepgramTokenWindowId);
-        });
+        setDeepgramTokenRefreshFn(event, byok);
+        if (byok) dropStaleReadyWarmConnection(this.deepgramStreaming);
 
         if (this.deepgramStreaming.hasWarmConnection()) {
           debugLogger.debug("Deepgram connection already warm", {}, "streaming");
           return { success: true, alreadyWarm: true };
         }
 
-        let token = this.deepgramStreaming.getCachedToken();
+        const generation = credentialGeneration;
+        let token = byok ? null : this.deepgramStreaming.getCachedToken();
         if (!token) {
-          debugLogger.debug("Fetching new Deepgram streaming token for warmup", {}, "streaming");
-          token = await fetchDeepgramStreamingToken(event);
+          debugLogger.debug(
+            "Fetching new Deepgram streaming token for warmup",
+            { byok },
+            "streaming"
+          );
+          token = await fetchDeepgramToken(event, byok);
         }
 
-        await this.deepgramStreaming.warmup({ ...options, token });
+        await this.deepgramStreaming.warmup({
+          ...options,
+          token,
+          credentialGeneration: generation,
+        });
         debugLogger.debug("Deepgram connection warmed up", {}, "streaming");
 
         return { success: true };
@@ -10426,8 +11582,8 @@ class IPCHandlers {
 
       deepgramStreamingStartInProgress = true;
       try {
-        const apiUrl = getApiUrl();
-        if (!apiUrl) {
+        const byok = options.mode === "byok";
+        if (!byok && !getApiUrl()) {
           return { success: false, error: "API not configured", code: "NO_API" };
         }
 
@@ -10439,11 +11595,10 @@ class IPCHandlers {
         if (!this.deepgramStreaming) {
           this.deepgramStreaming = new DeepgramStreaming();
         }
+        this.deepgramStreaming.adoptMode(options);
+        if (byok) dropStaleWarmConnection(this.deepgramStreaming);
 
-        this.deepgramStreaming.setTokenRefreshFn(async () => {
-          if (!deepgramTokenWindowId) throw new Error("No window reference");
-          return fetchDeepgramStreamingTokenFromWindow(deepgramTokenWindowId);
-        });
+        setDeepgramTokenRefreshFn(event, byok);
 
         if (this.deepgramStreaming.isConnected) {
           debugLogger.debug("Deepgram cleaning up stale connection before start", {}, "streaming");
@@ -10453,11 +11608,11 @@ class IPCHandlers {
         const hasWarm = this.deepgramStreaming.hasWarmConnection();
         debugLogger.debug("Deepgram streaming start", { hasWarmConnection: hasWarm }, "streaming");
 
-        let token = this.deepgramStreaming.getCachedToken();
+        let token = byok ? null : this.deepgramStreaming.getCachedToken();
         if (!token) {
-          debugLogger.debug("Fetching Deepgram streaming token from API", {}, "streaming");
-          token = await fetchDeepgramStreamingToken(event);
-          this.deepgramStreaming.cacheToken(token);
+          debugLogger.debug("Fetching Deepgram streaming token", { byok }, "streaming");
+          token = await fetchDeepgramToken(event, byok);
+          if (!byok) this.deepgramStreaming.cacheToken(token);
         } else {
           debugLogger.debug("Using cached Deepgram streaming token", {}, "streaming");
         }
@@ -10577,14 +11732,174 @@ class IPCHandlers {
       return this.deepgramStreaming.getStatus();
     });
 
+    let geminiStreamingStartInProgress = false;
+    let geminiSendDropCount = 0;
+    // One handshake at a time. A start that raced an in-flight warmup used to
+    // clear the cold-start buffer, spend a second single-use managed token and
+    // report success while the warmup's handshake (and its failure) were still
+    // pending on a promise nobody read.
+    let geminiConnectInFlight = null;
+
+    // Re-bound on every warmup/start so a warm socket promoted by a different
+    // window can never emit into the window that opened it.
+    const ensureGeminiStreaming = (event) => {
+      if (!this.geminiStreaming) {
+        this.geminiStreaming = new GeminiLiveStreaming();
+      }
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const emit = (channel, payload) => {
+        if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
+      };
+      const streaming = this.geminiStreaming;
+      streaming.onPartialTranscript = (text) => emit("gemini-partial-transcript", text);
+      streaming.onFinalTranscript = (text) => emit("gemini-final-transcript", text);
+      streaming.onError = (error) => emit("gemini-error", error.message);
+      streaming.onSessionEnd = (data) => emit("gemini-session-end", data);
+      return streaming;
+    };
+
+    // What a Gemini connection authenticated with: a managed one never serves a
+    // BYOK start or the reverse, and a BYOK one is not reused after a key save.
+    const geminiConnectionKey = (options) =>
+      options.mode === "byok" ? `byok:${credentialGeneration}` : "managed";
+
+    const connectGeminiStreaming = (event, options) => {
+      if (geminiConnectInFlight) return geminiConnectInFlight;
+      geminiConnectInFlight = (async () => {
+        const streaming = ensureGeminiStreaming(event);
+        // byok resolves to the raw API key, managed to a single-use ephemeral
+        // token; the client picks its Live method from `mode` accordingly.
+        const tokenOptions = { mode: options.mode, provider: "gemini-realtime" };
+        // Buffer before the token fetch (a real network round trip) so
+        // gemini-streaming-send has somewhere to put the first frames.
+        streaming.beginConnecting();
+        streaming.connectionKey = geminiConnectionKey(options);
+        const token = await fetchRealtimeToken(event, tokenOptions);
+        await streaming.connect({
+          ...options,
+          token,
+          refreshToken: () => fetchRealtimeToken(event, tokenOptions),
+        });
+      })().finally(() => {
+        geminiConnectInFlight = null;
+      });
+      return geminiConnectInFlight;
+    };
+
+    ipcMain.handle("gemini-streaming-warmup", async (event, options = {}) => {
+      try {
+        if (this.geminiStreaming?.isConnected) {
+          ensureGeminiStreaming(event);
+          debugLogger.debug("Gemini Live connection already warm", {}, "streaming");
+          return { success: true, alreadyWarm: true };
+        }
+        await connectGeminiStreaming(event, options);
+        return { success: true };
+      } catch (error) {
+        debugLogger.error("Gemini streaming warmup error", { error: error.message });
+        return toPolicyFailure(error);
+      }
+    });
+
+    ipcMain.handle("gemini-streaming-start", async (event, options = {}) => {
+      if (geminiStreamingStartInProgress) {
+        debugLogger.debug("Gemini streaming start already in progress, ignoring", {}, "streaming");
+        return { success: false, error: "Operation in progress" };
+      }
+
+      geminiStreamingStartInProgress = true;
+      try {
+        const streaming = ensureGeminiStreaming(event);
+        if (geminiConnectInFlight) await geminiConnectInFlight;
+        const usedWarmConnection =
+          streaming.isConnected &&
+          !options.forceNew &&
+          streaming.connectionKey === geminiConnectionKey(options);
+        if (!usedWarmConnection) {
+          if (streaming.isConnected) await streaming.disconnect(false);
+          await connectGeminiStreaming(event, options);
+        }
+        geminiSendDropCount = 0;
+        debugLogger.debug("Gemini streaming started", { usedWarmConnection }, "streaming");
+        return { success: true, usedWarmConnection };
+      } catch (error) {
+        debugLogger.error("Gemini streaming start error", { error: error.message });
+        if (error.code === "AUTH_EXPIRED") {
+          return { success: false, error: "Session expired", code: "AUTH_EXPIRED" };
+        }
+        return streamingStartFailure(error);
+      } finally {
+        geminiStreamingStartInProgress = false;
+      }
+    });
+
+    ipcMain.on("gemini-streaming-send", (_event, audioBuffer) => {
+      try {
+        if (!this.geminiStreaming) return;
+        const sent = this.geminiStreaming.sendAudio(Buffer.from(audioBuffer));
+        if (!sent) {
+          geminiSendDropCount++;
+          if (geminiSendDropCount <= 3 || geminiSendDropCount % 50 === 0) {
+            debugLogger.warn(
+              "Gemini audio send dropped",
+              {
+                dropCount: geminiSendDropCount,
+                isConnected: this.geminiStreaming.isConnected,
+                wsReadyState: this.geminiStreaming.ws?.readyState,
+              },
+              "streaming"
+            );
+          }
+        } else if (geminiSendDropCount > 0) {
+          debugLogger.debug(
+            "Gemini audio send resumed after drops",
+            { previousDrops: geminiSendDropCount },
+            "streaming"
+          );
+          geminiSendDropCount = 0;
+        }
+      } catch (error) {
+        debugLogger.error("Gemini streaming send error", { error: error.message });
+      }
+    });
+
+    ipcMain.on("gemini-streaming-finalize", () => {
+      this.geminiStreaming?.finalize();
+    });
+
+    ipcMain.handle("gemini-streaming-stop", async () => {
+      try {
+        const model = this.geminiStreaming?.currentModel || GEMINI_LIVE_MODEL;
+        const audioBytesSent = this.geminiStreaming?.audioBytesSent || 0;
+        let result = { text: "" };
+        if (this.geminiStreaming) {
+          result = await this.geminiStreaming.disconnect(true);
+        }
+
+        return { success: true, text: result?.text || "", model, audioBytesSent };
+      } catch (error) {
+        debugLogger.error("Gemini streaming stop error", { error: error.message });
+        return { success: false, error: error.message };
+      }
+    });
+
+    ipcMain.handle("gemini-streaming-status", async () => {
+      if (!this.geminiStreaming) {
+        return { isConnected: false, isConnecting: false };
+      }
+      return this.geminiStreaming.getStatus();
+    });
+
     ipcMain.handle("corti-streaming-warmup", async (_event, options = {}) => {
       try {
         if (!this.cortiStreaming) {
           this.cortiStreaming = new CortiStreaming();
         }
+        dropStaleReadyWarmConnection(this.cortiStreaming);
         if (this.cortiStreaming.hasWarmConnection() || this.cortiStreaming.isConnected) {
           return { success: true, alreadyWarm: true };
         }
+        const generation = credentialGeneration;
         const { token, environment, tenant } = await this._mintStoredCortiToken(options);
         await this.cortiStreaming.warmup({
           token,
@@ -10592,6 +11907,7 @@ class IPCHandlers {
           tenant,
           language: options.language,
           keyterms: options.keyterms,
+          credentialGeneration: generation,
         });
         return { success: true };
       } catch (error) {
@@ -10608,6 +11924,9 @@ class IPCHandlers {
           await this.cortiStreaming.disconnect(false);
         }
 
+        // Buffer before the token mint (a network round trip unless cached) so
+        // corti-streaming-send has somewhere to put the first frames.
+        this.cortiStreaming.beginConnecting();
         const { token, environment, tenant } = await this._mintStoredCortiToken(options);
         const win = BrowserWindow.fromWebContents(event.sender);
 
@@ -10624,6 +11943,7 @@ class IPCHandlers {
           if (win && !win.isDestroyed()) win.webContents.send("corti-session-end", data);
         };
 
+        dropStaleWarmConnection(this.cortiStreaming);
         await this.cortiStreaming.connect({
           token,
           environment,
@@ -10634,6 +11954,8 @@ class IPCHandlers {
         return { success: true };
       } catch (error) {
         debugLogger.error("Corti streaming start error", { error: error.message }, "streaming");
+        // Nothing is in flight after a failed start, so its held audio goes too.
+        this.cortiStreaming?.cleanup();
         return { success: false, error: error.message, code: error.code };
       }
     });
@@ -10673,11 +11995,12 @@ class IPCHandlers {
       const hotkeyManager = this.windowManager.hotkeyManager;
       const voiceAgentCallback = this.windowManager._voiceAgentHotkeyCallback;
       if (!voiceAgentCallback) {
-        return { success: false, message: "Voice agent hotkey callback not initialized" };
+        return { success: false };
       }
 
       if (!hotkey) {
-        hotkeyManager.unregisterSlot("voiceAgent");
+        const removed = await hotkeyManager.unregisterSlot("voiceAgent");
+        if (removed === false) return { success: false };
         this.environmentManager.saveVoiceAgentKey?.("");
         this.windowManager.reconcileNativeKeyListeners();
         this._notifyHotkeyChanged("");
@@ -10694,10 +12017,7 @@ class IPCHandlers {
         return { success: true, message: `Voice agent hotkey updated to: ${hotkey}` };
       }
 
-      return {
-        success: false,
-        message: result.error || `Failed to update voice agent hotkey to: ${hotkey}`,
-      };
+      return { success: false, message: result.error };
     });
 
     ipcMain.handle("get-voice-agent-key", async () => {
@@ -10708,11 +12028,12 @@ class IPCHandlers {
       const hotkeyManager = this.windowManager.hotkeyManager;
       const translationCallback = this.windowManager._translationHotkeyCallback;
       if (!translationCallback) {
-        return { success: false, message: "Translation hotkey callback not initialized" };
+        return { success: false };
       }
 
       if (!hotkey) {
-        hotkeyManager.unregisterSlot("translation");
+        const removed = await hotkeyManager.unregisterSlot("translation");
+        if (removed === false) return { success: false };
         this.environmentManager.saveTranslationKey?.("");
         this.windowManager.reconcileNativeKeyListeners();
         this._notifyHotkeyChanged("");
@@ -10729,10 +12050,7 @@ class IPCHandlers {
         return { success: true, message: `Translation hotkey updated to: ${hotkey}` };
       }
 
-      return {
-        success: false,
-        message: result.error || `Failed to update translation hotkey to: ${hotkey}`,
-      };
+      return { success: false, message: result.error };
     });
 
     ipcMain.handle("get-translation-key", async () => {
@@ -10958,7 +12276,7 @@ class IPCHandlers {
 
     ipcMain.handle("upsert-contact", async (_event, contact) => {
       try {
-        this.databaseManager.upsertContacts([contact]);
+        this.databaseManager.addManualContact(contact);
         return { success: true };
       } catch (error) {
         return { success: false };
@@ -10969,28 +12287,10 @@ class IPCHandlers {
       return crypto.createHash("md5").update(text.toLowerCase().trim()).digest("hex");
     });
 
-    ipcMain.handle("meeting-detection-get-preferences", async () => {
-      try {
-        return { success: true, preferences: this.meetingDetectionEngine.getPreferences() };
-      } catch (error) {
-        return { success: false, error: error.message };
-      }
-    });
-
-    ipcMain.handle("meeting-detection-set-preferences", async (_event, prefs) => {
-      try {
-        this.meetingDetectionEngine.setPreferences(prefs);
-        return { success: true };
-      } catch (error) {
-        return { success: false, error: error.message };
-      }
-    });
-
     const NOTIFICATION_PREF_KEYS = new Set([
       "notificationsEnabled",
       "notifyMeetingDetection",
       "notifyCalendarReminders",
-      "notifyUpdates",
     ]);
 
     ipcMain.handle("sync-notification-preferences", async (_event, prefs) => {
@@ -10998,17 +12298,23 @@ class IPCHandlers {
         if (!prefs || typeof prefs !== "object") {
           return { success: false, error: "Invalid preferences" };
         }
-        for (const [k, v] of Object.entries(prefs)) {
-          if (NOTIFICATION_PREF_KEYS.has(k)) {
-            this.windowManager.notificationPrefs[k] = !!v;
+        for (const [key, value] of Object.entries(prefs)) {
+          if (NOTIFICATION_PREF_KEYS.has(key)) {
+            this.windowManager.notificationPrefs[key] = !!value;
           }
         }
-        // Detection only serves the notification, so the toggle also gates the detector.
+        if (typeof prefs.meetingProcessDetection === "boolean") {
+          this.meetingProcessDetection = prefs.meetingProcessDetection;
+        }
         const { notificationsEnabled, notifyMeetingDetection } =
           this.windowManager.notificationPrefs;
-        this.meetingDetectionEngine?.setPreferences({
-          audioDetection: notificationsEnabled && notifyMeetingDetection,
-        });
+        this.meetingDetectionEngine?.setPreferences(
+          deriveDetectorPreferences({
+            notificationsEnabled,
+            notifyMeetingDetection,
+            meetingProcessDetection: this.meetingProcessDetection,
+          })
+        );
         return { success: true };
       } catch (error) {
         return { success: false, error: error.message };
@@ -11068,60 +12374,78 @@ class IPCHandlers {
       }
     });
 
-    ipcMain.handle("meeting-notification-respond", async (_event, detectionId, action) => {
-      try {
-        await this.meetingDetectionEngine.handleNotificationResponse(detectionId, action);
-        return { success: true };
-      } catch (error) {
-        return { success: false, error: error.message };
-      }
+    ipcMain.handle("get-meeting-notification-destination", (event) =>
+      this.getMeetingNotificationDestination(
+        this.windowManager.captureMeetingNotificationOwner(event.sender)
+      )
+    );
+    ipcMain.handle("select-meeting-notification-folder", (event, ref) =>
+      this.selectMeetingNotificationFolder(
+        this.windowManager.captureMeetingNotificationOwner(event.sender),
+        ref
+      )
+    );
+    ipcMain.handle("create-meeting-notification-folder", (event, request) =>
+      this.createMeetingNotificationFolder(
+        this.windowManager.captureMeetingNotificationOwner(event.sender),
+        request
+      )
+    );
+
+    ipcMain.handle("set-meeting-notification-surface", (event, state) => {
+      const owner = this.windowManager.captureMeetingNotificationOwner(event.sender);
+      return this.windowManager.setMeetingNotificationSurface(owner, state);
     });
 
-    registerMeetingAutoEndLifecycleHandlers(ipcMain, () => this.meetingDetectionEngine);
+    ipcMain.handle("meeting-notification-respond", (event, detectionId, action, options) => {
+      const owner = this.windowManager.captureMeetingNotificationOwner(event.sender);
+      if (!owner || owner.prompt.detectionId !== detectionId)
+        return { success: false, code: "STALE_NOTIFICATION" };
+      return this.meetingDetectionEngine.handleNotificationResponse(
+        detectionId,
+        action,
+        options,
+        owner
+      );
+    });
+    ipcMain.handle("confirm-meeting-note-navigation", (event, navigationId, status) =>
+      this.windowManager.confirmMeetingNoteNavigation(event.sender, navigationId, status)
+    );
 
     ipcMain.handle("join-calendar-meeting", async (_event, eventId) => {
       try {
-        await this.meetingDetectionEngine.joinCalendarMeeting(eventId);
+        // Sent from the open panel, which may have just opened the meeting
+        // link: leave the meeting in front rather than pulling the panel back.
+        await this.meetingDetectionEngine.joinCalendarMeeting(eventId, "calendar-join", {
+          activate: false,
+        });
         return { success: true };
       } catch (error) {
         return { success: false, error: error.message };
       }
     });
 
-    ipcMain.handle("get-meeting-notification-data", async () => {
+    ipcMain.handle("start-manual-meeting", () => this.windowManager.startManualMeeting());
+
+    ipcMain.handle("get-meeting-notification-data", async (event) => {
+      if (this.windowManager?.notificationWindow?.webContents !== event.sender) return null;
       return this.windowManager?._pendingNotificationData ?? null;
     });
 
-    ipcMain.handle("get-pending-meeting-note-navigation", async () => {
-      return this.windowManager?.consumePendingMeetingNoteNavigation() ?? null;
+    ipcMain.handle("get-pending-meeting-note-navigation", async (event) => {
+      return this.windowManager?.consumePendingMeetingNoteNavigation(event.sender) ?? null;
     });
 
     ipcMain.handle("get-pending-note-navigation", async () => {
       return this.windowManager?.consumePendingNoteNavigation() ?? null;
     });
 
+    ipcMain.handle("get-pending-settings-section", async () => {
+      return this.windowManager?.consumePendingSettingsSection() ?? null;
+    });
+
     ipcMain.handle("meeting-notification-ready", async (event) => {
       this.windowManager?.showNotificationWindow(event.sender);
-    });
-
-    ipcMain.handle("get-update-notification-data", async () => {
-      return this.windowManager?._pendingUpdateNotificationData ?? null;
-    });
-
-    ipcMain.handle("update-notification-ready", async () => {
-      this.windowManager?.showUpdateNotificationWindow();
-    });
-
-    ipcMain.handle("update-notification-respond", async (_event, action) => {
-      this.windowManager?.dismissUpdateNotification();
-      if (action === "update") {
-        try {
-          await this.updateManager?.downloadUpdate();
-        } catch (error) {
-          console.error("Failed to start update download from notification:", error);
-        }
-      }
-      return { success: true };
     });
 
     // Note files (markdown mirror) handlers
@@ -11300,23 +12624,12 @@ class IPCHandlers {
       try {
         const result = this.databaseManager.importNotes(pending.notes);
         if (result.imported > 0) {
-          const importedIds = result.noteIds;
-          // One-shot side effects: batched vector upsert of just the new notes
-          // and a single mirror rebuild — never per-note work (sync storm /
-          // O(notes × files) mirror scans).
+          // One-shot side effects: a single index wake-up (the SQLite triggers
+          // already journaled every imported note) and a single mirror rebuild —
+          // never per-note work (sync storm / O(notes × files) mirror scans).
           setImmediate(() => {
             try {
-              const vectorIndex = require("./vectorIndex");
-              if (vectorIndex.isReady()) {
-                const importedNotes = importedIds
-                  .map((id) => this.databaseManager.getNote(id))
-                  .filter(Boolean);
-                vectorIndex
-                  .reindexAll(importedNotes, (done, total) => {
-                    broadcastToWindows("semantic-reindex-progress", { done, total });
-                  })
-                  .catch(() => {});
-              }
+              this.notifyVectorChanges();
               if (this._noteFilesEnabled) this._rebuildMirror();
             } catch (sideEffectError) {
               debugLogger.error(
@@ -11661,6 +12974,34 @@ class IPCHandlers {
     return reconciledSpeakers;
   }
 
+  // The renderer's base covers the transcript it resumes; mappings and embeddings
+  // can also hold ids no row carries any more (merged clusters, a cluster that
+  // owned no segment), and a reused one would still name the new voice.
+  // A note recorded again before its last session's diarization lands has neither
+  // that result's ids in the seed nor its embeddings stored yet, so the session's
+  // reserved ceiling counts too.
+  _resolveMeetingSpeakerIndexBase(noteId, requestedBase) {
+    let base = normalizeSpeakerIndexBase(requestedBase);
+    if (noteId == null) return base;
+    for (const reservation of this._diarizationSpeakerReservations.values()) {
+      if (reservation.noteId === noteId) base = Math.max(base, reservation.ceiling);
+    }
+    try {
+      const storedIds = [
+        ...this.databaseManager.getSpeakerMappings(noteId).map((m) => m.speaker_id),
+        ...this.databaseManager.getNoteSpeakerEmbeddings(noteId).map((e) => e.speaker_id),
+      ];
+      return resolveSpeakerIndexBase(base, storedIds);
+    } catch (error) {
+      debugLogger.warn(
+        "Could not read stored speaker ids for the meeting note",
+        { noteId, error: error.message },
+        "speaker"
+      );
+      return base;
+    }
+  }
+
   _resolveSpeakerExpectation({ sessionConfig, noteId, observedSpeakerIds, diarizedSource }) {
     // Only a count the user set explicitly outranks the note: participants added
     // mid-meeting postdate the config snapshot taken at recording start.
@@ -11708,7 +13049,8 @@ class IPCHandlers {
     liveSpeakerState = null,
     sessionConfig = null,
     noteId = null,
-    diarizedSource = "system"
+    diarizedSource = "system",
+    speakerIndexBase = 0
   ) {
     const send = (payload) => {
       if (win && !win.isDestroyed()) {
@@ -11730,31 +13072,40 @@ class IPCHandlers {
 
     const fs = require("fs");
 
+    const observedSpeakerIds = new Set(
+      transcriptSegments
+        .filter((segment) => segment.source === "system" && segment.speaker)
+        .map((segment) => segment.speaker)
+    );
+    for (const speakerId of Object.keys(liveSpeakerState || {})) {
+      observedSpeakerIds.add(speakerId);
+    }
+
+    if (observedSpeakerIds.size > 10) {
+      debugLogger.warn("Excessive speaker count from live identification", {
+        observedSpeakers: observedSpeakerIds.size,
+      });
+    }
+
+    const { numSpeakers, cap } = this._resolveSpeakerExpectation({
+      sessionConfig,
+      noteId,
+      observedSpeakerIds,
+      diarizedSource,
+    });
+    // Reserved before the async work so a "record more" started while this runs
+    // numbers its speakers past every cluster the result can name.
+    if (noteId != null) {
+      this._diarizationSpeakerReservations.set(sessionId, {
+        noteId,
+        ceiling: speakerIndexBase + cap,
+      });
+    }
+
     (async () => {
       let tmpWav = null;
       try {
         tmpWav = await this.diarizationManager.convertRawPcmToWav(rawPcmPath, 24000);
-        const observedSpeakerIds = new Set(
-          transcriptSegments
-            .filter((segment) => segment.source === "system" && segment.speaker)
-            .map((segment) => segment.speaker)
-        );
-        for (const speakerId of Object.keys(liveSpeakerState || {})) {
-          observedSpeakerIds.add(speakerId);
-        }
-
-        if (observedSpeakerIds.size > 10) {
-          debugLogger.warn("Excessive speaker count from live identification", {
-            observedSpeakers: observedSpeakerIds.size,
-          });
-        }
-
-        const { numSpeakers, cap } = this._resolveSpeakerExpectation({
-          sessionConfig,
-          noteId,
-          observedSpeakerIds,
-          diarizedSource,
-        });
         let diarizationSegments = await this.diarizationManager.diarize(
           tmpWav,
           numSpeakers > 0 ? { numSpeakers } : {}
@@ -11785,15 +13136,18 @@ class IPCHandlers {
         const enrichedSegments = this.diarizationManager.mergeWithTranscript(
           normalized,
           diarizationSegments,
-          { diarizedSource }
+          { diarizedSource, speakerIndexBase }
         );
 
         const speakerSet = new Set(diarizationSegments.map((d) => d.speaker));
-        const speakerRenumber = new Map();
-        let sIdx = 0;
-        for (const sp of speakerSet) {
-          speakerRenumber.set(sp, `speaker_${sIdx}`);
-          sIdx++;
+        const speakerRenumber = buildSpeakerRenumber(speakerSet, speakerIndexBase);
+        // Narrowed to the ids the result actually names; kept until quit, since the
+        // renderer persists them only after this send.
+        if (noteId != null) {
+          this._diarizationSpeakerReservations.set(sessionId, {
+            noteId,
+            ceiling: speakerIndexBase + speakerRenumber.size,
+          });
         }
 
         // Mirrors the mic-mode single-cluster softening in mergeWithTranscript:
@@ -11898,6 +13252,7 @@ class IPCHandlers {
         send({ segments: enrichedSegments, speakerEmbeddings: speakerEmbeddingsMap });
       } catch (err) {
         debugLogger.warn("Background diarization failed", { error: err.message });
+        this._diarizationSpeakerReservations.delete(sessionId);
         send({ segments: [] });
       } finally {
         try {
@@ -11927,7 +13282,7 @@ class IPCHandlers {
     const result = this.databaseManager.deleteNote(id);
     if (result?.success) {
       setImmediate(() => broadcastToWindows("note-deleted", { id }));
-      this._asyncVectorDelete(id);
+      this.notifyVectorChanges();
       this._asyncMirrorDelete(id);
     }
     return result;

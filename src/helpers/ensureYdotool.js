@@ -188,23 +188,24 @@ function getYdotoolStatus() {
   const hasYdotool = commandExists("ydotool");
   const hasYdotoold = commandExists("ydotoold");
   const hasWtype = commandExists("wtype");
-  const hasWlCopy = commandExists("wl-copy");
   const daemonRunning = isYdotooldRunning();
   const hasService = serviceFileExists();
   const hasUinput = isUinputAccessible();
   const hasUdevRule = udevRuleExists();
   const hasGroup = userInInputGroup();
-  const { isWayland, isKde, isWlroots } = getLinuxSessionInfo();
+  const { isWayland, isKde, isWlroots, isCosmic, requiresWlCopy } = getLinuxSessionInfo();
 
   return {
     isLinux: process.platform === "linux",
     isWayland,
     isKde,
     isWlroots,
+    isCosmic,
+    requiresWlCopy,
     hasYdotool,
     hasYdotoold,
     hasWtype,
-    hasWlCopy,
+    hasWlCopy: requiresWlCopy && commandExists("wl-copy"),
     daemonRunning,
     hasService,
     hasUinput,

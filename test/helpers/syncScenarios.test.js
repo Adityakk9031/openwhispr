@@ -299,7 +299,11 @@ test("S2 two devices: an older empty shell never destroys the transcript and the
     .slice(mark)
     .filter((c) => c.method === "PATCH" && c.path === "/api/notes/update");
   assert.equal(patches.length, 1, "A must attempt exactly one push for its stale shell");
-  assert.equal(patches[0].body.content, "", "A really did offer an empty body");
+  assert.equal(
+    patches[0].body.content,
+    undefined,
+    "A's empty body is unconfirmed, so it is left out rather than offered as a clear"
+  );
   assert.equal(
     patches[0].body.updated_at,
     F_TITLE,
@@ -326,9 +330,8 @@ test("S2 two devices: an older empty shell never destroys the transcript and the
   const mark2 = cloud.log.length;
   await syncOnce(deviceA);
   assert.equal(
-    cloud.log
-      .slice(mark2)
-      .filter((c) => c.method === "PATCH" && c.path === "/api/notes/update").length,
+    cloud.log.slice(mark2).filter((c) => c.method === "PATCH" && c.path === "/api/notes/update")
+      .length,
     0,
     "a conflicted row must not be re-pushed before the user resolves it"
   );

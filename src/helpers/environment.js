@@ -9,8 +9,6 @@ const { BYOK_API_KEYS } = require("../config/secretKeys");
 
 const SECRET_KEYS = [
   ...BYOK_API_KEYS.map((k) => k.env),
-  "ASSEMBLYAI_API_KEY",
-  "DEEPGRAM_API_KEY",
   "CORTI_CLIENT_ID",
   "CORTI_CLIENT_SECRET",
   "CUSTOM_TRANSCRIPTION_API_KEY",
@@ -49,6 +47,8 @@ const PERSISTED_KEYS = [
   "WHISPER_VULKAN_ENABLED",
   "WHISPER_VULKAN_DEVICE",
   "WHISPER_GPU_FAILED",
+  "WHISPER_GPU_FAILED_REASON_CUDA",
+  "WHISPER_GPU_FAILED_REASON_VULKAN",
   "WHISPER_THREADS",
   "TRANSCRIPTION_GPU_UUID",
   "INTELLIGENCE_GPU_UUID",
@@ -263,22 +263,6 @@ class EnvironmentManager {
       delete process.env[envVarName];
     }
     return { success: true };
-  }
-
-  getAssemblyAIKey() {
-    return this._getKey("ASSEMBLYAI_API_KEY");
-  }
-
-  saveAssemblyAIKey(key) {
-    return this._saveKey("ASSEMBLYAI_API_KEY", key);
-  }
-
-  getDeepgramKey() {
-    return this._getKey("DEEPGRAM_API_KEY");
-  }
-
-  saveDeepgramKey(key) {
-    return this._saveKey("DEEPGRAM_API_KEY", key);
   }
 
   getCortiClientId() {

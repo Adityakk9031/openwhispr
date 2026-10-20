@@ -264,8 +264,8 @@ const CONTROL_PANEL_CONFIG = {
 };
 
 const NOTIFICATION_WINDOW_CONFIG = {
-  width: 392,
-  height: 92,
+  width: 416,
+  height: 84,
   frame: false,
   transparent: true,
   alwaysOnTop: true,
@@ -285,18 +285,16 @@ const NOTIFICATION_WINDOW_CONFIG = {
   type: OVERLAY_WINDOW_TYPES.notification,
 };
 
-const AUTO_END_NOTIFICATION_WINDOW_SIZE = {
-  width: 480,
-  height: 128,
-};
-
-function getMeetingNotificationWindowSize(promptData) {
-  if (promptData?.kind === "auto-end") {
-    return AUTO_END_NOTIFICATION_WINDOW_SIZE;
-  }
+function fitMeetingNotificationWindow(contentHeight, workArea) {
+  const width = Math.max(1, Math.min(NOTIFICATION_WINDOW_CONFIG.width, workArea.width));
+  const height = Math.max(1, Math.min(Math.ceil(contentHeight), 512, workArea.height));
+  const marginX = Math.min(16, Math.max(0, workArea.width - width));
+  const marginY = Math.min(16, Math.max(0, workArea.height - height));
   return {
-    width: NOTIFICATION_WINDOW_CONFIG.width,
-    height: NOTIFICATION_WINDOW_CONFIG.height,
+    x: workArea.x + workArea.width - width - marginX,
+    y: workArea.y + marginY,
+    width,
+    height,
   };
 }
 
@@ -340,26 +338,20 @@ class WindowPositionUtil {
     };
   }
 
-  static getNotificationPosition(display, customSize = null) {
-    const { width, height } = customSize || NOTIFICATION_WINDOW_CONFIG;
-    const MARGIN = 16;
-    const workArea = display.workArea || display.bounds;
-    // Same negative-origin trap as getMainWindowPosition: clamp to the display,
-    // not to zero, or a monitor above the primary one puts the prompt nowhere.
-    const bounds = {
-      x: workArea.x + workArea.width - width - MARGIN,
-      y: workArea.y + MARGIN,
-      width,
-      height,
-    };
-    return { ...WindowPositionUtil.clampToWorkArea(bounds, display), width, height };
+  static getNotificationPosition(display) {
+    return fitMeetingNotificationWindow(
+      NOTIFICATION_WINDOW_CONFIG.height,
+      display.workArea || display.bounds
+    );
   }
 
-  static setupAlwaysOnTop(window) {
+  // `level` only applies on macOS; Windows and Linux already use the strongest
+  // level their window managers honor.
+  static setupAlwaysOnTop(window, { level = "floating" } = {}) {
     if (process.platform === "darwin") {
       // macOS: Use panel level for proper floating behavior
       // This ensures the window stays on top across spaces and fullscreen apps
-      window.setAlwaysOnTop(true, "floating", 1);
+      window.setAlwaysOnTop(true, level, 1);
       // Re-applying the collection behavior when nothing drifted makes the
       // window server momentarily pull the window out of the active Space,
       // which blinks the entire visible window. Enforce calls land on hot
@@ -376,7 +368,7 @@ class WindowPositionUtil {
       }
 
       if (window.isVisible()) {
-        window.setAlwaysOnTop(true, "floating", 1);
+        window.setAlwaysOnTop(true, level, 1);
       }
     } else if (process.platform === "win32") {
       window.setAlwaysOnTop(true, "pop-up-menu");
@@ -390,6 +382,7 @@ class WindowPositionUtil {
 }
 
 module.exports = {
+  fitMeetingNotificationWindow,
   MAIN_WINDOW_CONFIG,
   CONTROL_PANEL_CONFIG,
   ONBOARDING_WINDOW_SIZES,
@@ -400,8 +393,6 @@ module.exports = {
   fitDictationErrorContentWindowToWorkArea,
   fitDictationErrorWindowToWorkArea,
   resolveHorizontalWindowDirection,
-  AUTO_END_NOTIFICATION_WINDOW_SIZE,
-  getMeetingNotificationWindowSize,
   WINDOW_SIZES,
   WindowPositionUtil,
   resolveOverlayWindowType,

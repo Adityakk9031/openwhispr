@@ -15,6 +15,9 @@ function createDeferred() {
 
 const createdWindows = [];
 let devServerWaitPromise = Promise.resolve();
+let tokenState = { token: null, generation: 0 };
+let bindingScope = null;
+let workArea = { x: 0, y: 0, width: 1200, height: 900 };
 
 class FakeBrowserWindow extends EventEmitter {
   constructor(options) {
@@ -26,13 +29,36 @@ class FakeBrowserWindow extends EventEmitter {
     this.loadUrlCount = 0;
     this.showCount = 0;
     this.ignoreMouseEvents = [];
-    this.webContents = {
+    this.webContents = Object.assign(new EventEmitter(), {
       send: (channel, payload) => this.messages.push({ channel, payload }),
-    };
+    });
     createdWindows.push(this);
   }
 
-  setContentProtection() {}
+  setContentProtection(value) {
+    this.protected = value;
+  }
+  getBounds() {
+    return this.bounds || { x: 608, y: 16, width: 416, height: 84 };
+  }
+  setBounds(bounds) {
+    this.bounds = bounds;
+  }
+  setFocusable(value) {
+    (this.focusEvents ||= []).push(value ? "focusable" : "passive");
+  }
+  focus() {
+    (this.focusEvents ||= []).push("focus");
+  }
+  show() {
+    (this.focusEvents ||= []).push("show");
+  }
+  blur() {
+    (this.focusEvents ||= []).push("blur");
+  }
+  setShape(regions) {
+    this.shape = regions;
+  }
 
   setIgnoreMouseEvents(ignore, options) {
     this.ignoreMouseEvents.push({ ignore, options });
@@ -77,16 +103,35 @@ class FakeDragManager {
 
 const originalLoad = Module._load;
 Module._load = function loadWindowManagerWithStubs(request, parent, isMain) {
+  if (request === "./tokenStore") return { getState: () => tokenState };
+  if (request === "./accountScopeBinding")
+    return {
+      read: () => ({}),
+      resolveActiveAccountScope: () => bindingScope,
+    };
   if (request === "electron") {
     return {
       app: { on: () => undefined },
-      screen: { getPrimaryDisplay: () => ({}), on: () => undefined },
+      screen: {
+        getPrimaryDisplay: () => ({ workArea }),
+        getDisplayMatching: () => ({ workArea }),
+        getCursorScreenPoint: () => ({ x: -10000, y: -10000 }),
+        on: () => undefined,
+        removeListener: () => undefined,
+      },
       BrowserWindow: FakeBrowserWindow,
       shell: {},
       dialog: {},
     };
   }
-  if (request === "./debugLogger") return { warn: () => undefined };
+  if (request === "./debugLogger") {
+    return {
+      info: () => undefined,
+      warn: () => undefined,
+      debug: () => undefined,
+      error: () => undefined,
+    };
+  }
   if (request === "./hotkeyManager") return FakeHotkeyManager;
   if (request === "./dragManager") return FakeDragManager;
   if (request === "./menuManager") return {};
@@ -101,20 +146,17 @@ Module._load = function loadWindowManagerWithStubs(request, parent, isMain) {
   if (request === "./dockManager") return {};
   if (request === "./i18nMain") return { i18nMain: { t: (key) => key } };
   if (request === "./windowConfig") {
-    const detectionSize = { width: 392, height: 92 };
-    const autoEndSize = { width: 620, height: 116 };
+    const notificationSize = { width: 416, height: 84 };
     return {
+      ...originalLoad.call(this, request, parent, isMain),
       MAIN_WINDOW_CONFIG: {},
       CONTROL_PANEL_CONFIG: {},
-      NOTIFICATION_WINDOW_CONFIG: { ...detectionSize, acceptFirstMouse: true },
-      AUTO_END_NOTIFICATION_WINDOW_SIZE: autoEndSize,
-      getMeetingNotificationWindowSize: (data) =>
-        data?.kind === "auto-end" ? autoEndSize : detectionSize,
+      NOTIFICATION_WINDOW_CONFIG: { ...notificationSize, acceptFirstMouse: true },
       WINDOW_SIZES: {},
       WindowPositionUtil: {
-        getNotificationPosition: (_display, size = detectionSize) => ({
-          ...size,
-          x: 1000 - size.width,
+        getNotificationPosition: () => ({
+          ...notificationSize,
+          x: 1000 - notificationSize.width,
           y: 16,
         }),
         setupAlwaysOnTop: () => undefined,
@@ -124,6 +166,7 @@ Module._load = function loadWindowManagerWithStubs(request, parent, isMain) {
   return originalLoad.call(this, request, parent, isMain);
 };
 const WindowManager = require("../../src/helpers/windowManager");
+const { getNotificationTimeoutMs } = require("../../src/helpers/notificationTimer");
 Module._load = originalLoad;
 
 const notificationWindowFor = (index) => createdWindows[index];
@@ -173,6 +216,9 @@ function installFakeTimers() {
 
 test.beforeEach(() => {
   createdWindows.length = 0;
+  tokenState = { token: null, generation: 0 };
+  bindingScope = null;
+  workArea = { x: 0, y: 0, width: 1200, height: 900 };
 });
 
 test("native push-to-talk force-stops after the safety timeout", () => {
@@ -341,27 +387,41 @@ test("push-to-talk dictation follows the companion pill's availability", () => {
   assert.deepEqual(rendererChannels, ["prepare-dictation", "start-dictation"]);
 });
 
+test("a stop press probes the target again instead of reusing the start press's", () => {
+  const manager = createNormalWindowManager();
+  const captures = [];
+  manager.mainWindow = { isDestroyed: () => false, webContents: { send: () => undefined } };
+  manager.hotkeyManager = {
+    isInListeningMode: () => false,
+    unregisterAll: () => undefined,
+  };
+  manager.textEditMonitor = { captureTargetPid: () => Promise.resolve(null) };
+  manager.selectionManager = { captureTarget: (options) => captures.push(options) };
+  manager.showDictationPanel = () => undefined;
+  manager.sendPrepareDictation = () => undefined;
+
+  manager.sendToggleDictation();
+  manager.setDictationLifecycleState("recording");
+  manager.sendToggleDictation();
+
+  assert.deepEqual(captures, [{ force: false }, { force: true }]);
+});
+
 test("window manager starts fail-closed and suppresses normal-app popup surfaces", async () => {
   const manager = new WindowManager();
-  const update = { version: "2.0.0", releaseDate: "2026-08-20" };
 
   assert.equal(manager.isMeetingInputAllowed(), false);
   assert.equal(await manager.showMeetingNotification({ detectionId: "onboarding" }), false);
   assert.equal(await manager.showTranscriptionPreview("partial transcript"), undefined);
-  assert.equal(await manager.showUpdateNotification(update), false);
-  assert.deepEqual(manager._deferredUpdateNotificationInfo, update);
   assert.deepEqual(createdWindows, []);
 });
 
-test("window creation uses the auto-end dimensions and variant-aware position", async () => {
+test("window creation uses the notification dimensions and position", async () => {
   const manager = createNormalWindowManager();
+  const notification = { detectionId: "calendar:next", source: "calendar" };
 
   try {
-    const showPromise = manager.showMeetingAutoEndNotification({
-      sessionId: "meeting-1",
-      expiresAt: 70_000,
-      reason: "silence",
-    });
+    const showPromise = manager.showMeetingNotification(notification, { autoDismiss: false });
     const notificationWindow = createdWindows[0];
 
     assert.deepEqual(
@@ -372,136 +432,15 @@ test("window creation uses the auto-end dimensions and variant-aware position", 
         x: notificationWindow.options.x,
         y: notificationWindow.options.y,
       },
-      { acceptFirstMouse: true, width: 620, height: 116, x: 380, y: 16 }
+      { acceptFirstMouse: true, width: 416, height: 84, x: 584, y: 16 }
     );
-    // The reason rides along in the pending payload the overlay will fetch.
-    assert.deepEqual(manager._pendingNotificationData, {
-      kind: "auto-end",
-      sessionId: "meeting-1",
-      expiresAt: 70_000,
-      reason: "silence",
-    });
+    // The payload the overlay fetches is stored verbatim.
+    assert.deepEqual(manager._pendingNotificationData, notification);
 
     notificationWindow.loadDeferred.resolve();
     await showPromise;
   } finally {
     manager.dismissMeetingNotification();
-  }
-});
-
-test("unexpected auto-end window closure invalidates that restart offer", async () => {
-  const manager = createNormalWindowManager();
-  const closedSessions = [];
-  manager.meetingDetectionEngine = {
-    handleAutoEndNotificationClosed: (sessionId) => closedSessions.push(sessionId),
-  };
-
-  const showPromise = manager.showMeetingAutoEndNotification({
-    sessionId: "meeting-1",
-    expiresAt: 70_000,
-    reason: "silence",
-  });
-  const notificationWindow = createdWindows[0];
-  notificationWindow.loadDeferred.resolve();
-  await showPromise;
-
-  notificationWindow.close();
-
-  assert.deepEqual(closedSessions, ["meeting-1"]);
-});
-
-test("replacing an auto-end notification invalidates its restart offer", async () => {
-  const manager = createNormalWindowManager();
-  const closedSessions = [];
-  manager.meetingDetectionEngine = {
-    handleAutoEndNotificationClosed: (sessionId) => closedSessions.push(sessionId),
-  };
-
-  const autoEndPromise = manager.showMeetingAutoEndNotification({
-    sessionId: "meeting-1",
-    expiresAt: Date.now() + 30_000,
-    reason: "silence",
-  });
-  createdWindows[0].loadDeferred.resolve();
-  await autoEndPromise;
-
-  const replacementPromise = manager.showMeetingNotification(
-    { kind: "detection", detectionId: "calendar:next", source: "calendar" },
-    { autoDismiss: false }
-  );
-
-  try {
-    assert.deepEqual(closedSessions, ["meeting-1"]);
-  } finally {
-    createdWindows[1].loadDeferred.resolve();
-    await replacementPromise;
-    manager.dismissMeetingNotification();
-  }
-});
-
-test("auto-end notification loading has a fail-safe timeout", async () => {
-  const timers = installFakeTimers();
-  const manager = createNormalWindowManager();
-  const showPromise = manager.showMeetingAutoEndNotification({
-    sessionId: "meeting-1",
-    expiresAt: 70_000,
-    reason: "silence",
-  });
-  const notificationWindow = createdWindows[0];
-
-  try {
-    assert.equal(timers.pendingCount(), 1);
-    timers.runAll();
-
-    await assert.rejects(showPromise, /timed out/i);
-    assert.equal(notificationWindow.isDestroyed(), true);
-    assert.equal(manager.notificationWindow, null);
-  } finally {
-    manager.dismissMeetingNotification();
-    notificationWindow.loadDeferred.resolve();
-    await showPromise.catch(() => undefined);
-    timers.restore();
-  }
-});
-
-test("auto-end recovery subtracts load time from its expiry and hover cannot extend it", async () => {
-  const timers = installFakeTimers();
-  const manager = createNormalWindowManager();
-  const originalDateNow = Date.now;
-  const timedOutNotifications = [];
-  let now = 40_000;
-  Date.now = () => now;
-  manager.meetingDetectionEngine = {
-    handleNotificationTimeout: (notification) => timedOutNotifications.push(notification),
-    handleAutoEndNotificationClosed: () => undefined,
-  };
-
-  const notification = {
-    kind: "auto-end",
-    sessionId: "meeting-1",
-    expiresAt: 70_000,
-    reason: "silence",
-  };
-  const showPromise = manager.showMeetingAutoEndNotification(notification);
-  const notificationWindow = createdWindows[0];
-
-  try {
-    now = 45_000;
-    notificationWindow.loadDeferred.resolve();
-    await showPromise;
-    assert.equal(timers.pendingDelays().includes(25_000), true);
-
-    manager.setNotificationInteractivity(notificationWindow.webContents, true);
-    manager.setNotificationInteractivity(notificationWindow.webContents, false);
-    assert.equal(timers.pendingDelays().includes(25_000), true);
-
-    timers.runDelay(25_000);
-    assert.deepEqual(timedOutNotifications, [notification]);
-    assert.equal(notificationWindow.isDestroyed(), true);
-  } finally {
-    Date.now = originalDateNow;
-    manager.dismissMeetingNotification();
-    timers.restore();
   }
 });
 
@@ -622,66 +561,32 @@ test("a stale ready callback cannot show the replacement notification window", a
   }
 });
 
-test("an auto-end notification dismissed while loading reports that it was not shown", async () => {
-  const manager = createNormalWindowManager();
-
-  const showPromise = manager.showMeetingAutoEndNotification({
-    sessionId: "meeting-1",
-    expiresAt: Date.now() + 30_000,
-    reason: "silence",
-  });
-  manager.dismissMeetingNotification();
-  createdWindows[0].loadDeferred.resolve();
-
-  assert.equal(await showPromise, false);
-});
-
-test("an auto-end notification whose load fails after dismissal reports that it was not shown", async () => {
-  const manager = createNormalWindowManager();
-
-  const showPromise = manager.showMeetingAutoEndNotification({
-    sessionId: "meeting-1",
-    expiresAt: Date.now() + 30_000,
-    reason: "silence",
-  });
-  manager.dismissMeetingNotification();
-  createdWindows[0].loadDeferred.reject(new Error("load failed"));
-
-  assert.equal(await showPromise, false);
-});
-
-// The engine flushes its queued detections when an expiring restart offer
-// releases them, so a prompt raised from the timeout handler must outlive the
-// dismissal that closes the expired card.
+// The engine may raise the next queued prompt from its timeout handler, so that
+// prompt must outlive the dismissal that closes the expired card.
 test("a notification raised from the timeout handler survives the dismissal that follows", async () => {
   const timers = installFakeTimers();
   const manager = createNormalWindowManager();
-  const originalDateNow = Date.now;
-  let now = 40_000;
-  Date.now = () => now;
   let replacementPromise = null;
   manager.meetingDetectionEngine = {
     handleNotificationTimeout: () => {
       replacementPromise = manager.showMeetingNotification(
-        { kind: "detection", detectionId: "calendar:next", source: "calendar" },
+        { detectionId: "calendar:next", source: "calendar" },
         { autoDismiss: false }
       );
     },
-    handleAutoEndNotificationClosed: () => undefined,
+    handleDetectionNotificationClosed: () => undefined,
   };
 
-  const showPromise = manager.showMeetingAutoEndNotification({
-    kind: "auto-end",
-    sessionId: "meeting-1",
-    expiresAt: 70_000,
-    reason: "silence",
+  const showPromise = manager.showMeetingNotification({
+    detectionId: "calendar:first",
+    source: "calendar",
   });
 
   try {
     notificationWindowFor(0).loadDeferred.resolve();
     await showPromise;
 
-    timers.runDelay(30_000);
+    timers.runDelay(getNotificationTimeoutMs("calendar"));
     notificationWindowFor(1).loadDeferred.resolve();
     await replacementPromise;
 
@@ -689,7 +594,6 @@ test("a notification raised from the timeout handler survives the dismissal that
     assert.equal(notificationWindowFor(1).isDestroyed(), false);
     assert.equal(manager.notificationWindow, notificationWindowFor(1));
   } finally {
-    Date.now = originalDateNow;
     manager.dismissMeetingNotification();
     timers.restore();
   }
@@ -703,7 +607,6 @@ test("unexpected detection card closure releases that detection", async () => {
   };
 
   const showPromise = manager.showMeetingNotification({
-    kind: "detection",
     detectionId: "audio:sustained-audio",
     source: "audio",
   });
@@ -730,7 +633,6 @@ test("an expired detection reports the timeout once, not also as a close", async
   };
 
   const showPromise = manager.showMeetingNotification({
-    kind: "detection",
     detectionId: "audio:sustained-audio",
     source: "audio",
   });
@@ -755,7 +657,6 @@ test("a detection card whose load fails releases that detection", async () => {
   };
 
   const showPromise = manager.showMeetingNotification({
-    kind: "detection",
     detectionId: "audio:sustained-audio",
     source: "audio",
   });
@@ -765,4 +666,482 @@ test("a detection card whose load fails releases that detection", async () => {
   // would ever settle this detection.
   await assert.rejects(showPromise, /load failed/);
   assert.deepEqual(closedDetections, ["audio:sustained-audio"]);
+});
+
+test("manual meeting starts fail closed like the meeting hotkey", async () => {
+  let starts = 0;
+  const engine = { startManualMeeting: async () => (starts += 1) };
+
+  const onboarding = new WindowManager();
+  onboarding.meetingDetectionEngine = engine;
+  await onboarding.startManualMeeting();
+  assert.equal(starts, 0);
+
+  const manager = createNormalWindowManager();
+  manager.meetingDetectionEngine = engine;
+  manager.hotkeyManager.isInListeningMode = () => true;
+  await manager.startManualMeeting();
+  assert.equal(starts, 0);
+
+  manager.hotkeyManager.isInListeningMode = () => false;
+  await manager.startManualMeeting();
+  assert.equal(starts, 1);
+});
+
+// Only the renderer can open the assistant panel, and it owns the policy and
+// recording state the pill menu gates the item on, so nothing may be shown,
+// focused, or created before it accepts.
+test("the tray's Ask assistant asks the renderer without showing or focusing the pill", () => {
+  const fakeMainWindow = (events) => ({
+    isDestroyed: () => false,
+    isMinimized: () => false,
+    isVisible: () => true,
+    focus: () => events.push("focus"),
+    show: () => events.push("show"),
+    showInactive: () => events.push("show"),
+    webContents: { send: (channel) => events.push(channel) },
+  });
+
+  const onboardingEvents = [];
+  const onboarding = new WindowManager();
+  onboarding.mainWindow = fakeMainWindow(onboardingEvents);
+  onboarding.sendOpenAssistantPanel();
+  assert.deepEqual(onboardingEvents, []);
+
+  const events = [];
+  const manager = createNormalWindowManager();
+  manager.mainWindow = fakeMainWindow(events);
+  manager.sendOpenAssistantPanel();
+  assert.deepEqual(events, ["open-assistant-panel"]);
+
+  // Capturing a hotkey swallows it, like every other input path.
+  const capturingEvents = [];
+  const capturing = createNormalWindowManager();
+  capturing.mainWindow = fakeMainWindow(capturingEvents);
+  capturing.hotkeyManager.isInListeningMode = () => true;
+  capturing.sendOpenAssistantPanel();
+  assert.deepEqual(capturingEvents, []);
+});
+
+async function showOwned(manager, id = "calendar:editing") {
+  manager.meetingDetectionEngine ||= {
+    databaseManager: { activeAccountId: null },
+    activeDetections: new Map(),
+    handleNotificationTimeout() {},
+  };
+  manager.meetingDetectionEngine.activeDetections.set(id, { source: "calendar", key: id });
+  const showing = manager.showMeetingNotification({ detectionId: id, source: "calendar" });
+  const win = manager.notificationWindow;
+  win.loadDeferred.resolve();
+  await showing;
+  manager.showNotificationWindow(win.webContents);
+  return { win, owner: manager.captureMeetingNotificationOwner(win.webContents) };
+}
+const surface = (revision, mode = "form", focus = "keep") => ({
+  revision,
+  mode,
+  focus,
+  contentHeight: mode === "closed" ? 84 : 260,
+  regions: [
+    { x: 12, y: 12, width: 392, height: 60 },
+    ...(mode === "closed" ? [] : [{ x: 116, y: 84, width: 288, height: 164 }]),
+  ],
+});
+
+test("leaving the card cannot resume an open form countdown", async () => {
+  const timers = installFakeTimers();
+  const manager = createNormalWindowManager();
+  try {
+    const { win, owner } = await showOwned(manager);
+    assert.ok(owner);
+    manager.setNotificationInteractivity(win.webContents, true);
+    manager.setMeetingNotificationSurface(owner, surface(1, "form", "request"));
+    manager.setNotificationInteractivity(win.webContents, false);
+    assert.equal(owner.pointerInside, false);
+    timers.runAll();
+    assert.equal(win.isDestroyed(), false);
+    manager.setMeetingNotificationSurface(owner, surface(2, "closed", "release"));
+    timers.runAll();
+    assert.equal(win.isDestroyed(), true);
+  } finally {
+    manager.dismissMeetingNotification();
+    timers.restore();
+  }
+});
+
+test("only deliberate open activates; closing avoids macOS window restacking", async () => {
+  const manager = createNormalWindowManager();
+  try {
+    const { win, owner } = await showOwned(manager);
+    assert.equal(win.protected, true);
+    assert.deepEqual(win.focusEvents || [], []);
+    manager.setMeetingNotificationSurface(owner, surface(1, "list"));
+    assert.deepEqual(win.focusEvents || [], []);
+    manager.setMeetingNotificationSurface(owner, surface(2, "form", "request"));
+    // Linux stays focusable from construction; setFocusable is only supported
+    // by the macOS/Windows path. Both paths must activate only on request.
+    const activation =
+      process.platform === "linux" ? ["show", "focus"] : ["focusable", "show", "focus"];
+    assert.deepEqual(win.focusEvents, activation);
+    manager.setMeetingNotificationSurface(owner, surface(3, "closed", "release"));
+    const release =
+      process.platform === "darwin"
+        ? ["passive"]
+        : process.platform === "linux"
+          ? ["blur"]
+          : ["blur", "passive"];
+    assert.deepEqual(win.focusEvents, [...activation, ...release]);
+    assert.equal(win.getBounds().height, 84);
+  } finally {
+    manager.dismissMeetingNotification();
+  }
+});
+
+test("reused detection strings and stale layout cannot mutate the current prompt", async () => {
+  const manager = createNormalWindowManager();
+  try {
+    const first = await showOwned(manager);
+    const second = await showOwned(manager);
+    assert.equal(manager.captureMeetingNotificationOwner(first.win.webContents), null);
+    assert.equal(
+      manager.setMeetingNotificationSurface(first.owner, surface(20)).code,
+      "STALE_NOTIFICATION"
+    );
+    assert.equal(manager.setMeetingNotificationSurface(second.owner, surface(2)).success, true);
+    assert.equal(manager.setMeetingNotificationSurface(second.owner, surface(1)).success, false);
+    for (const invalid of [NaN, Infinity, -1]) {
+      assert.equal(
+        manager.setMeetingNotificationSurface(second.owner, {
+          ...surface(3),
+          contentHeight: invalid,
+        }).success,
+        false
+      );
+    }
+    assert.equal(second.win.getBounds().height, 260);
+  } finally {
+    manager.dismissMeetingNotification();
+  }
+});
+
+test("small negative-origin displays bound the full surface and its input regions", async () => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: "linux" });
+  const manager = createNormalWindowManager();
+  try {
+    const { win, owner } = await showOwned(manager);
+    workArea = { x: -320, y: -240, width: 320, height: 240 };
+    const result = manager.setMeetingNotificationSurface(owner, surface(1));
+    assert.deepEqual(result.value, { width: 320, height: 240, maxHeight: 240 });
+    assert.deepEqual(win.getBounds(), { x: -320, y: -240, width: 320, height: 240 });
+    assert.ok(
+      win.shape.every((r) => r.x >= 0 && r.y >= 0 && r.x + r.width <= 320 && r.y + r.height <= 240)
+    );
+  } finally {
+    manager.dismissMeetingNotification();
+    Object.defineProperty(process, "platform", platform);
+  }
+});
+
+test("credential replacement fences ownership before database account reconciliation", async () => {
+  const manager = createNormalWindowManager();
+  try {
+    const { owner } = await showOwned(manager);
+    manager.retireMeetingNotificationScope();
+    assert.equal(manager.isMeetingNotificationOwner(owner), false);
+    assert.equal(manager.notificationWindow, null);
+    assert.deepEqual(manager.meetingRecentDestinations, []);
+  } finally {
+    manager.dismissMeetingNotification();
+  }
+});
+
+test("a stored token without an account binding scopes the prompt as signed out", async () => {
+  tokenState = { token: "signed-out-token", generation: 0 };
+  const manager = createNormalWindowManager();
+  try {
+    const { owner } = await showOwned(manager);
+    assert.equal(manager.isMeetingNotificationOwner(owner), true);
+    manager.meetingDetectionEngine.databaseManager.activeAccountId = "unbound-account";
+    assert.equal(manager.isMeetingNotificationOwner(owner), false);
+  } finally {
+    manager.dismissMeetingNotification();
+  }
+});
+
+async function navigationFixture() {
+  const manager = createNormalWindowManager();
+  const { owner } = await showOwned(manager);
+  let row = { id: 9, space_id: 1, folder_id: 3, deleted_at: null, left_team: 0 };
+  manager.meetingDetectionEngine.databaseManager = {
+    activeAccountId: null,
+    getNote: () => row,
+    getSpace: (id) => (id === 1 ? { id: 1, name: "Private", kind: "private" } : null),
+    getFolders: () => [
+      { id: 3, space_id: 1, name: "Meetings" },
+      { id: 4, space_id: 1, name: "Moved" },
+    ],
+    getSpaces: () => [{ id: 1, name: "Private", kind: "private" }],
+    getMeetingsFolder: () => ({ id: 3 }),
+  };
+  owner.committedNoteId = 9;
+  const panel = new EventEmitter();
+  let loading = false;
+  panel.isDestroyed = () => false;
+  panel.webContents = new EventEmitter();
+  panel.webContents.isLoading = () => loading;
+  panel.webContents.send = () => {};
+  manager.controlPanelWindow = panel;
+  manager.createControlPanelWindow = async () => {};
+  const payload = { navigationId: "navigate-one", noteId: 9, spaceId: 1, folderId: 3 };
+  return {
+    manager,
+    owner,
+    panel,
+    payload,
+    setRow: (next) => {
+      row = next;
+    },
+    row,
+    start: () => manager.queueMeetingNoteNavigation(payload, { owner }),
+    // Like Electron, a new panel's load resolves inside did-finish-load, while
+    // isLoading() is still true; did-stop-loading clears it a tick later.
+    createPanel: async () => {
+      loading = true;
+      setImmediate(() => {
+        loading = false;
+        panel.webContents.emit("did-stop-loading");
+      });
+    },
+  };
+}
+
+test("only the consuming current panel can confirm a navigation once", async () => {
+  const f = await navigationFixture();
+  try {
+    const pending = f.start();
+    await new Promise(setImmediate);
+    assert.equal(f.manager.consumePendingMeetingNoteNavigation({}), null);
+    assert.deepEqual(f.manager.consumePendingMeetingNoteNavigation(f.panel.webContents), f.payload);
+    assert.equal(
+      f.manager.confirmMeetingNoteNavigation({}, "navigate-one").code,
+      "STALE_NOTIFICATION"
+    );
+    assert.equal(
+      f.manager.confirmMeetingNoteNavigation(f.panel.webContents, "navigate-one").success,
+      true
+    );
+    assert.equal((await pending).success, true);
+    assert.equal(
+      f.manager.confirmMeetingNoteNavigation(f.panel.webContents, "navigate-one").success,
+      false
+    );
+  } finally {
+    f.manager.dismissMeetingNotification();
+  }
+});
+
+test("deleted, retracted, and moved notes fail final confirmation after delayed editor load", async () => {
+  for (const change of [
+    { deleted_at: "now" },
+    { left_team: 1 },
+    { folder_id: 4 },
+    { folder_id: null },
+  ]) {
+    const f = await navigationFixture();
+    try {
+      const pending = f.start();
+      await new Promise(setImmediate);
+      f.manager.consumePendingMeetingNoteNavigation(f.panel.webContents);
+      f.setRow({ ...f.row, ...change });
+      const result = f.manager.confirmMeetingNoteNavigation(f.panel.webContents, "navigate-one");
+      assert.equal(result.code, "folder_id" in change ? "LINKED_NOTE_CHANGED" : "NOTE_UNAVAILABLE");
+      if ("folder_id" in change)
+        assert.equal(result.context.existingNote.folderId, change.folder_id);
+      assert.equal((await pending).success, false);
+      assert.equal(f.manager.notificationWindow.isDestroyed(), false);
+    } finally {
+      f.manager.dismissMeetingNotification();
+    }
+  }
+});
+
+test("an absent editor times out and late confirmation cannot authorize recording", async () => {
+  const timers = installFakeTimers();
+  const f = await navigationFixture();
+  try {
+    const pending = f.start();
+    await new Promise(setImmediate);
+    timers.runDelay(15000);
+    assert.equal((await pending).code, "START_FAILED");
+    assert.equal(
+      f.manager.confirmMeetingNoteNavigation(f.panel.webContents, "navigate-one").success,
+      false
+    );
+  } finally {
+    f.manager.dismissMeetingNotification();
+    timers.restore();
+  }
+});
+
+test("panel destruction and account retirement cancel pending navigation", async () => {
+  for (const cause of ["panel", "account"]) {
+    const f = await navigationFixture();
+    const contents = f.panel.webContents;
+    try {
+      const pending = f.start();
+      await new Promise(setImmediate);
+      if (cause === "panel") {
+        // Electron's getter throws once the window is destroyed.
+        Object.defineProperty(f.panel, "webContents", {
+          get() {
+            throw new Error("Object has been destroyed");
+          },
+        });
+        f.panel.emit("closed");
+      }
+      if (cause === "account") f.manager.retireMeetingNotificationScope();
+      assert.equal((await pending).success, false);
+      assert.equal(f.manager.confirmMeetingNoteNavigation(contents, "navigate-one").success, false);
+    } finally {
+      f.manager.dismissMeetingNotification();
+    }
+  }
+});
+
+test("a Start that creates the panel delivers once it loads, past the onboarding gate", async () => {
+  const f = await navigationFixture();
+  try {
+    // A fresh control panel document raises the gate, which hides every prompt.
+    f.manager.createControlPanelWindow = async () => {
+      f.manager.setOnboardingActive(true);
+      await f.createPanel();
+    };
+    const pending = f.start();
+    await new Promise(setImmediate);
+    assert.equal(f.manager.notificationWindow, null);
+    assert.deepEqual(f.manager.consumePendingMeetingNoteNavigation(f.panel.webContents), f.payload);
+    assert.equal(
+      f.manager.confirmMeetingNoteNavigation(f.panel.webContents, "navigate-one").success,
+      true
+    );
+    assert.equal((await pending).success, true);
+  } finally {
+    f.manager.dismissMeetingNotification();
+  }
+});
+
+test("a Join navigation leaves an open panel behind the meeting it opened", async () => {
+  const f = await navigationFixture();
+  try {
+    const opened = [];
+    f.manager.createControlPanelWindow = async (options) => opened.push(options);
+    const pending = f.manager.queueMeetingNoteNavigation(f.payload, {
+      owner: f.owner,
+      activate: false,
+    });
+    await new Promise(setImmediate);
+    f.manager.consumePendingMeetingNoteNavigation(f.panel.webContents);
+    f.manager.confirmMeetingNoteNavigation(f.panel.webContents, "navigate-one");
+    assert.equal((await pending).success, true);
+    await f.manager.queueMeetingNoteNavigation({ noteId: 9 }, { activate: false });
+    assert.deepEqual(opened, [{ activate: false }, { activate: false }]);
+  } finally {
+    f.manager.dismissMeetingNotification();
+  }
+});
+
+test("replacing an audio prompt retires only its captured detection", async () => {
+  const manager = createNormalWindowManager();
+  try {
+    await showOwned(manager, "audio:sustained-audio");
+    manager.meetingDetectionEngine.activeDetections.set("queued", { source: "calendar" });
+    await showOwned(manager, "calendar:replacement");
+    assert.equal(
+      manager.meetingDetectionEngine.activeDetections.has("audio:sustained-audio"),
+      false
+    );
+    assert.equal(manager.meetingDetectionEngine.activeDetections.has("calendar:replacement"), true);
+    assert.equal(manager.meetingDetectionEngine.activeDetections.has("queued"), true);
+  } finally {
+    manager.dismissMeetingNotification();
+  }
+});
+
+test("notification renderer crash retires its owner even while the window survives", async () => {
+  const manager = createNormalWindowManager();
+  const { win, owner } = await showOwned(manager);
+  win.webContents.emit("render-process-gone", {}, { reason: "crashed" });
+  assert.equal(manager.isMeetingNotificationOwner(owner), false);
+  assert.equal(manager.notificationWindow, null);
+});
+
+test("identical layout reports do not resize or show the notification again", async () => {
+  const manager = createNormalWindowManager();
+  try {
+    const { win, owner } = await showOwned(manager);
+    const sizes = [];
+    const initialLoads = win.loadUrlCount;
+    const resize = win.setBounds.bind(win);
+    win.setBounds = (bounds) => {
+      sizes.push(bounds);
+      resize(bounds);
+    };
+    manager.setMeetingNotificationSurface(owner, surface(1, "list", "request"));
+    const opens = win.focusEvents.slice();
+    manager.setMeetingNotificationSurface(owner, surface(2, "list"));
+    assert.equal(sizes.length, 1);
+    manager.setMeetingNotificationSurface(owner, surface(3, "closed", "release"));
+    manager.setMeetingNotificationSurface(owner, surface(4, "closed"));
+    assert.equal(sizes.length, 2);
+    assert.deepEqual(win.focusEvents, [
+      ...opens,
+      ...(process.platform === "darwin" ? [] : ["blur"]),
+      ...(process.platform === "linux" ? [] : ["passive"]),
+    ]);
+    assert.equal(win.loadUrlCount, initialLoads);
+  } finally {
+    manager.dismissMeetingNotification();
+  }
+});
+
+test("closing a destroyed native window does not read its webContents getter", async () => {
+  const manager = createNormalWindowManager();
+  const { win } = await showOwned(manager);
+  const contents = win.webContents;
+  Object.defineProperty(win, "webContents", {
+    get() {
+      if (win.destroyed) throw new Error("Object has been destroyed");
+      return contents;
+    },
+  });
+  assert.doesNotThrow(() => manager.dismissMeetingNotification());
+  assert.equal(contents.listenerCount("render-process-gone"), 0);
+});
+
+test("release preserves macOS stacking while Windows and Linux still blur", async () => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  try {
+    for (const name of ["darwin", "win32", "linux"]) {
+      Object.defineProperty(process, "platform", { value: name });
+      const manager = createNormalWindowManager();
+      try {
+        const { win, owner } = await showOwned(manager);
+        manager.setMeetingNotificationSurface(owner, surface(1, "form", "request"));
+        win.focusEvents = [];
+        manager.setMeetingNotificationSurface(owner, surface(2, "closed", "release"));
+        assert.deepEqual(
+          win.focusEvents,
+          name === "darwin" ? ["passive"] : name === "win32" ? ["blur", "passive"] : ["blur"],
+          name
+        );
+        assert.equal(manager.notificationWindow, win);
+        assert.equal(win.isDestroyed(), false);
+      } finally {
+        manager.dismissMeetingNotification();
+      }
+    }
+  } finally {
+    Object.defineProperty(process, "platform", platform);
+  }
 });

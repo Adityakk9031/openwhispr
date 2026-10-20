@@ -1,9 +1,13 @@
+import { markdownToPlainText } from "./markdownToPlainText";
+
 export type AssistantResponseDelivery =
   | {
       mode: "paste";
       sessionId: string;
       restoreClipboard: boolean;
       allowClipboardFallback: boolean;
+      /** Ask for prose and strip markdown before pasting. False for a markdown-friendly target. */
+      plainText: boolean;
     }
   | { mode: "clipboard" };
 
@@ -13,7 +17,7 @@ interface AssistantResponseDeliveryApi {
     text: string,
     options?: { restoreClipboard?: boolean; allowClipboardFallback?: boolean }
   ) => Promise<{ success: boolean }>;
-  writeClipboard?: (text: string) => Promise<{ success: boolean }>;
+  writeClipboard?: (text: string) => Promise<{ success: boolean; xwaylandOnly?: boolean }>;
 }
 
 interface ClipboardWriter {
@@ -28,11 +32,13 @@ interface AssistantResponseDeliveryDependencies {
 export function createAssistantResponseDelivery({
   autoPasteEnabled,
   deliverySessionId,
+  acceptsMarkdown,
   restoreClipboard,
   allowClipboardFallback,
 }: {
   autoPasteEnabled: boolean;
   deliverySessionId?: string;
+  acceptsMarkdown?: boolean;
   restoreClipboard: boolean;
   allowClipboardFallback: boolean;
 }): AssistantResponseDelivery | null {
@@ -44,6 +50,7 @@ export function createAssistantResponseDelivery({
     sessionId: deliverySessionId,
     restoreClipboard,
     allowClipboardFallback,
+    plainText: !acceptsMarkdown,
   };
 }
 
@@ -54,6 +61,9 @@ async function copyAssistantResponse(
 ): Promise<boolean> {
   try {
     const result = await electronAPI?.writeClipboard?.(content);
+    // The user's app still has focus, so it can't read this copy (#2621); the
+    // renderer's clipboard would land in the same place.
+    if (result?.xwaylandOnly) return false;
     if (result?.success === true) return true;
   } catch {}
 
@@ -74,15 +84,24 @@ export async function deliverAssistantResponse(
   const clipboard = dependencies.clipboard ?? navigator.clipboard;
 
   if (delivery.mode === "paste") {
+    // The strip also covers the clipboard fallback (the user pastes into the
+    // same field by hand); an answer it empties entirely is pasted raw.
+    const text = delivery.plainText ? markdownToPlainText(content) || content : content;
     try {
-      const result = await electronAPI?.pasteAtCapturedTarget?.(delivery.sessionId, content, {
+      const result = await electronAPI?.pasteAtCapturedTarget?.(delivery.sessionId, text, {
         restoreClipboard: delivery.restoreClipboard,
         allowClipboardFallback: delivery.allowClipboardFallback,
       });
       if (result?.success === true) return { pasted: true, copied: false };
     } catch {}
+    return {
+      pasted: false,
+      copied: await copyAssistantResponse(text, electronAPI, clipboard),
+    };
   }
 
+  // A clipboard-only delivery is shown in the panel as rendered markdown and
+  // its Copy button yields the raw markdown; keep the two copy paths equal.
   return {
     pasted: false,
     copied: await copyAssistantResponse(content, electronAPI, clipboard),

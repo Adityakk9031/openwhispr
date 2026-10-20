@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import {
   getAssistantFooterTransitionTimeline,
   resolveAssistantThinkingTransition,
+  shouldBeginAssistantFollowUpThinking,
 } from "../helpers/voicePillPresentation";
 import {
   closeAssistantSessionState,
@@ -85,8 +86,10 @@ export function useAssistantPanel({
   }, [mounted, open, responseReady, clearFooterTimers]);
 
   const openPanel = useCallback(async () => {
-    setThinking(false);
+    // After the guard: a second open (the tray's Ask assistant while a command is
+    // already thinking) must not clear the flourish of the one in flight.
     if (openRef.current) return;
+    setThinking(false);
     const generation = ++openGenerationRef.current;
     openRef.current = true;
     closingRef.current = false;
@@ -335,4 +338,28 @@ export function useAssistantPanel({
     completeContentFade,
     noteDictationError,
   };
+}
+
+/**
+ * Starts the open panel's thinking when a voice-assistant follow-up spoken into
+ * it is processed. `recording` is the `useAudioRecording` result and
+ * `assistant` the `useAssistantPanel` result.
+ */
+export function useAssistantFollowUpThinking(recording, assistant) {
+  const { isAssistantVoice, isProcessing, cancellingRef } = recording;
+  const { openRef, beginThinking } = assistant;
+  // A layout effect reads the cancel flag in the processing commit itself; a
+  // passive one runs after a paint, when the teardown may already have cleared it.
+  useLayoutEffect(() => {
+    if (
+      shouldBeginAssistantFollowUpThinking({
+        isAssistantVoice,
+        isProcessing,
+        isCancelling: cancellingRef.current,
+        panelOpen: openRef.current,
+      })
+    ) {
+      beginThinking();
+    }
+  }, [isAssistantVoice, isProcessing, cancellingRef, openRef, beginThinking]);
 }

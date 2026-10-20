@@ -968,7 +968,7 @@ test("acknowledgeNoteCreate settles only the exact create snapshot", (t) => {
     "migration-cloud-id",
     "2026-07-29T11:30:00.000Z",
     null,
-    false
+    { settleIfUnchanged: false }
   );
   const afterPartial = db.getNote(partial.id);
   assert.equal(partialAck.outcome, "pending");
@@ -1671,6 +1671,34 @@ test("upsertSpaceFromCloud round-trips the teams mirror as a parsed array", (t) 
   assert.deepEqual(db.getSpaces().find((s) => s.id === space.id).teams, []);
 });
 
+test("upsertSpaceFromCloud mirrors the direct role and clears it when the grant goes", (t) => {
+  const db = createDb(t);
+  if (!db) return;
+  const created = db.upsertSpaceFromCloud({
+    id: "space-1",
+    name: "Design space",
+    workspace_id: "ws-1",
+    my_role: "admin",
+    my_direct_role: "admin",
+    teams: [],
+  });
+  assert.equal(created.my_direct_role, "admin");
+  assert.equal(db.getSpaceByCloudSpaceId("space-1").my_direct_role, "admin");
+
+  // Access now flows only through a team: the effective role survives, the
+  // direct grant must not linger and keep "Leave space" offered.
+  const updated = db.upsertSpaceFromCloud({
+    id: "space-1",
+    name: "Design space",
+    workspace_id: "ws-1",
+    my_role: "member",
+    teams: [{ id: "team-1", name: "Design", my_role: "member" }],
+  });
+  assert.equal(updated.id, created.id);
+  assert.equal(updated.my_role, "member");
+  assert.equal(updated.my_direct_role, null);
+});
+
 test("upsertSpaceFromCloud adopts a pre-spaces row via its single backfilled team", (t) => {
   const db = createDb(t);
   if (!db) return;
@@ -1724,4 +1752,18 @@ test("upsertSpaceFromCloud never adopts by team for multi-team spaces", (t) => {
   });
   assert.notEqual(fresh.client_space_id, "legacy-client-id");
   assert.equal(fresh.sync_status, "pending", "a genuinely new space still backfills");
+});
+
+test("a deferred create receipt retains team retraction while personal backup is off", (t) => {
+  const db = createDb(t);
+  if (!db) return;
+  const team = createTestTeamSpace(db, { name: "Deferred move" }).space;
+  const note = db.saveNote("Draft", "team work", "personal", null, null, null, team.id).note;
+  db.updateNote(note.id, { space_id: db.getPrivateSpaceId(), folder_id: null });
+  const ack = db.acknowledgeNoteCreate(note.id, note, "team-cloud", null, null, {
+    requiresReconciliation: true,
+  });
+  assert.equal(ack.outcome, "awaiting-cloud");
+  assert.equal(db.getNote(note.id).left_team, 1);
+  assert.ok(db.getPendingNotes("team").some((candidate) => candidate.id === note.id));
 });

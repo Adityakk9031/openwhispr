@@ -162,28 +162,71 @@ test("Linux onboarding shows paste-tool installation and recheck guidance", asyn
   assertGuidancePrecedesActions(markup, "sudo apt install xdotool");
 });
 
-test("permissions replaces Back with Logout, keeps Continue at the bottom, and gates it on microphone access", async (t) => {
+// COSMIC pastes into other apps without wtype, but terminals like Warp only take
+// the Ctrl+Shift+V that wtype sends there.
+test("COSMIC onboarding recommends wtype for terminals until it is installed", async (t) => {
+  const vite = await createOnboardingRenderer(t);
+  const { default: CompactPermissionsStep } = await vite.ssrLoadModule(
+    "/components/onboarding/CompactPermissionsStep.tsx"
+  );
+
+  const render = (hasWtype, available = true) =>
+    renderToStaticMarkup(
+      React.createElement(CompactPermissionsStep, {
+        permissions: permissions({
+          pasteToolsInfo: {
+            platform: "linux",
+            available,
+            method: available ? "uinput" : null,
+            requiresPermission: false,
+            isWayland: true,
+            isWlroots: false,
+            isCosmic: true,
+            hasWtype,
+            recommendedInstall: available ? undefined : "xdotool",
+          },
+        }),
+        systemAudio,
+        onContinue: noop,
+      })
+    );
+
+  const missing = render(false);
+  assert.match(missing, /pasteToolsInfo\.wtypeCosmicTerminalsDescription/);
+  assert.match(missing, /sudo apt install wtype/);
+  assert.doesNotMatch(missing, /pasteToolsInfo\.withoutToolPrefix/);
+  assertGuidancePrecedesActions(missing, "sudo apt install wtype");
+
+  assert.doesNotMatch(render(true), /sudo apt install wtype/);
+
+  // With nothing pasting at all, wtype alone would only fix terminals.
+  const unavailable = render(false, false);
+  assert.match(unavailable, /sudo apt install xdotool/);
+  assert.doesNotMatch(unavailable, /wtypeCosmicTerminalsDescription/);
+});
+
+test("permissions offers Back ahead of Continue and gates Continue on microphone access", async (t) => {
   const vite = await createOnboardingRenderer(t, "darwin");
   const { default: CompactPermissionsStep } = await vite.ssrLoadModule(
     "/components/onboarding/CompactPermissionsStep.tsx"
   );
 
-  const render = (micPermissionGranted, onLogout) =>
+  const render = (micPermissionGranted, onBack) =>
     renderToStaticMarkup(
       React.createElement(CompactPermissionsStep, {
         permissions: permissions({ micPermissionGranted }),
         systemAudio,
         screenContext,
-        onLogout,
+        onBack,
         onContinue: noop,
       })
     );
 
-  const blocked = render(false, asyncNoop);
-  assert.doesNotMatch(blocked, />common\.back<\/button>/);
+  const blocked = render(false, noop);
+  assert.doesNotMatch(blocked, /common\.logout/);
   assert.ok(
-    blocked.indexOf("common.logout") < blocked.indexOf("common.continue"),
-    "Logout takes the place Back had, ahead of Continue"
+    blocked.indexOf("common.back") < blocked.indexOf("common.continue"),
+    "Back sits ahead of Continue"
   );
   // Continue is part of the step now rather than an overlay above it, so it
   // follows the permission rows in the DOM, and so in tab order.
@@ -193,16 +236,13 @@ test("permissions replaces Back with Logout, keeps Continue at the bottom, and g
   );
   assert.match(blocked, /<button[^>]*\bdisabled=""[^>]*>common\.continue<\/button>/);
 
-  const ready = render(true, asyncNoop);
+  const ready = render(true, noop);
   assert.match(ready, /<button[^>]*>common\.continue<\/button>/);
   assert.doesNotMatch(ready, /\bdisabled=""[^>]*>common\.continue/);
 
-  // Guests reach this step without ever signing in, so they get no Logout.
-  const guest = render(true);
-  assert.doesNotMatch(guest, /common\.logout/);
-  assert.match(guest, /common\.continue/);
+  // With nothing to return to (a resumed session with no history), Back is gone.
+  assert.doesNotMatch(render(true, undefined), /common\.back/);
 });
-
 test("macOS onboarding offers optional Screen Context setup", async (t) => {
   const vite = await createOnboardingRenderer(t, "darwin");
   const { default: CompactPermissionsStep } = await vite.ssrLoadModule(
@@ -219,7 +259,7 @@ test("macOS onboarding offers optional Screen Context setup", async (t) => {
   );
 
   assert.match(markup, /dictationAgent\.screenContext\.title/);
-  assert.match(markup, /lucide-laptop/);
+  assert.match(markup, /data-icon="laptop"/);
   assert.doesNotMatch(markup, /onboarding\.permissions\.recommended/);
   assert.equal(
     markup.match(/onboarding\.permissions\.optional/g)?.length,
@@ -291,7 +331,7 @@ test("Windows onboarding offers Screen Context as a permissionless opt-in", asyn
   );
 
   assert.match(markup, /dictationAgent\.screenContext\.title/);
-  assert.match(markup, /lucide-laptop/);
+  assert.match(markup, /data-icon="laptop"/);
   assert.equal(
     markup.match(/onboarding\.permissions\.optional/g)?.length,
     1,
@@ -328,7 +368,7 @@ test("provider setup stages mark dictation complete before Assistant", async (t)
   for (const stepId of ["byok-assistant", "local-assistant"]) {
     const markup = renderToStaticMarkup(React.createElement(SetupStageStepper, { stepId }));
 
-    assert.match(markup, /lucide-circle-check/);
-    assert.doesNotMatch(markup, /lucide-audio-lines/);
+    assert.match(markup, /data-icon="circle-check"/);
+    assert.doesNotMatch(markup, /data-icon="audio-lines"/);
   }
 });
