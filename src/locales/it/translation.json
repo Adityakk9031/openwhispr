@@ -2106,15 +2106,11 @@
             "step1Desc": "Avvia ydotoold e abilitalo per l'esecuzione a ogni accesso.",
             "step2Title": "Verifica che sia in esecuzione"
           },
-          "xclip": {
-            "step1Title": "Installa xclip"
-          },
           "wlCopy": {
             "step1Title": "Installa wl-clipboard",
             "step2Title": "Verifica l'installazione"
           }
         },
-        "xclipDesc": "Strumento appunti per incollare in KDE Wayland (xclip o xsel)",
         "nixos": {
           "intro": "Stai usando NixOS. L'incolla automatico richiede ydotool e l'accesso a /dev/uinput, che NixOS gestisce in modo dichiarativo.",
           "detected": "Rilevato",

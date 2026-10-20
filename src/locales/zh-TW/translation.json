@@ -2106,15 +2106,11 @@
             "step1Desc": "啟動 ydotoold 並設定為每次登入時自動執行。",
             "step2Title": "驗證是否正在執行"
           },
-          "xclip": {
-            "step1Title": "安裝 xclip"
-          },
           "wlCopy": {
             "step1Title": "安裝 wl-clipboard",
             "step2Title": "驗證安裝"
           }
         },
-        "xclipDesc": "KDE Wayland 貼上用的剪貼簿工具（xclip 或 xsel）",
         "nixos": {
           "intro": "你正在使用 NixOS。自動貼上需要 ydotool 及 /dev/uinput 存取權限，NixOS 以宣告式方式授予這些權限。",
           "detected": "已偵測",

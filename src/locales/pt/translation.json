@@ -2085,15 +2085,11 @@
             "step1Desc": "Inicie o ydotoold e ative-o para que seja executado em cada início de sessão.",
             "step2Title": "Verificar se está em execução"
           },
-          "xclip": {
-            "step1Title": "Instalar xclip"
-          },
           "wlCopy": {
             "step1Title": "Instalar o wl-clipboard",
             "step2Title": "Verificar a instalação"
           }
         },
-        "xclipDesc": "Ferramenta de área de transferência para colar no KDE Wayland (xclip ou xsel)",
         "nixos": {
           "intro": "Está no NixOS. A colagem automática requer ydotool e acesso a /dev/uinput, que o NixOS concede de forma declarativa.",
           "detected": "Detetado",

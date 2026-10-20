@@ -2158,15 +2158,11 @@
             "step1Desc": "Inicia ydotoold y habilítalo para que se ejecute en cada inicio de sesión.",
             "step2Title": "Verificar que está en ejecución"
           },
-          "xclip": {
-            "step1Title": "Instalar xclip"
-          },
           "wlCopy": {
             "step1Title": "Instalar wl-clipboard",
             "step2Title": "Verificar la instalación"
           }
         },
-        "xclipDesc": "Herramienta de portapapeles para pegado en KDE Wayland (xclip o xsel)",
         "nixos": {
           "intro": "Estás en NixOS. El pegado automático necesita ydotool y acceso a /dev/uinput, que NixOS concede de forma declarativa.",
           "detected": "Detectado",

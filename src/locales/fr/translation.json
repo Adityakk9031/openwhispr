@@ -2400,15 +2400,11 @@
             "step1Desc": "Démarrez ydotoold et activez-le pour qu'il se lance à chaque connexion.",
             "step2Title": "Vérifier qu'il est en cours d'exécution"
           },
-          "xclip": {
-            "step1Title": "Installer xclip"
-          },
           "wlCopy": {
             "step1Title": "Installer wl-clipboard",
             "step2Title": "Vérifier l'installation"
           }
         },
-        "xclipDesc": "Outil de presse-papiers pour le collage KDE Wayland (xclip ou xsel)",
         "nixos": {
           "intro": "Vous êtes sur NixOS. Le collage automatique nécessite ydotool et l'accès à /dev/uinput, que NixOS accorde de façon déclarative.",
           "detected": "Détecté",

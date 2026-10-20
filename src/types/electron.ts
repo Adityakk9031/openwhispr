@@ -2337,8 +2337,6 @@ declare global {
         isWlroots: boolean;
         isCosmic: boolean;
         requiresWlCopy: boolean;
-        hasXclip: boolean;
-        hasXsel: boolean;
       }>;
 
       // Globe key listener for hotkey capture (macOS only)

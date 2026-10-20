@@ -844,7 +844,10 @@ class ClipboardManager {
       return { type: "image", data: data.image };
     }
     if (keys.length === 1 && keys[0] === "text") {
-      return { type: "text", data: data.text };
+      // A Wayland app's copy leaves an older X11 owner (often this app) in place on
+      // KWin before 6.0.3, and the KDE restore writes the Wayland clipboard too.
+      if (!getLinuxSessionInfo().isKde) return { type: "text", data: text };
+      return { type: "text", data: this._readWaylandClipboardText() ?? text };
     }
     if (keys.length > 0) return { type: "formats", data };
 

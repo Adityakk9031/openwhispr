@@ -78,7 +78,6 @@ function loadClipboardManager({
   Module._load = function loadWithMocks(request, parent, isMain) {
     if (request === "electron") {
       return {
-        app: { isPackaged: false, isReady: () => false },
         clipboard: fakeClipboard,
         systemPreferences: {
           isTrustedAccessibilityClient: () => accessibility,
@@ -146,14 +145,10 @@ function createSpawn(calls, exitCodes, { stdout = [] } = {}) {
   };
 }
 
-function createSpawnSync(calls, handler) {
-  return function mockedSpawnSync(command, args = [], options = {}) {
-    calls.push({ command, args, options });
-    if (handler) {
-      const custom = handler(command, args, options);
-      if (custom !== undefined) return custom;
-    }
-    return { status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") };
+function createSpawnSync(calls) {
+  return function mockedSpawnSync(command, args = []) {
+    calls.push({ command, args });
+    return { status: 0, stdout: Buffer.from("") };
   };
 }
 
@@ -302,10 +297,28 @@ test("a clipboard XWayland can read is saved without asking wl-paste", async (t)
   const manager = new Manager();
   manager.commandExists = (command) => command === "wl-paste";
 
-  const snapshot = await withWaylandEnvironment("KDE", () => manager._saveClipboard());
+  const snapshot = await withWaylandEnvironment("GNOME", () => manager._saveClipboard());
 
   assert.deepEqual(snapshot, { type: "text", data: "readable over X11" });
   assert.deepEqual(spawnSyncCalls, []);
+});
+
+// KWin before 6.0.3 keeps this app as the X11 owner after a Wayland app copies, so
+// the X11 text can be older than the Wayland clipboard the KDE restore writes.
+test("a KDE text clipboard is saved from the Wayland side over a stale X11 read", async (t) => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: "linux" });
+  t.after(() => Object.defineProperty(process, "platform", platform));
+  resetClipboard({ text: "stale X11 text" });
+  const Manager = loadClipboardManager({
+    spawnSync: () => ({ status: 0, stdout: Buffer.from("copied in a Wayland app") }),
+  });
+  const manager = new Manager();
+  manager.commandExists = (command) => command === "wl-paste";
+
+  const snapshot = await withWaylandEnvironment("KDE", () => manager._saveClipboard());
+
+  assert.deepEqual(snapshot, { type: "text", data: "copied in a Wayland app" });
 });
 
 test("an empty clipboard on X11 is saved without asking wl-paste", async (t) => {
@@ -1682,22 +1695,4 @@ test("_writePrimarySelection on KDE mirrors wl-copy to Electron's X11 selection"
     [["wl-copy", ["--primary", "--", "selection text"]]]
   );
   assert.deepEqual(fakeClipboard.writes, [["writeText", "selection text"]]);
-});
-
-test("_writeClipboardWayland on non-KDE (e.g. GNOME) does not invoke X11 clipboard tools", async () => {
-  const spawnSyncCalls = [];
-  const TestClipboardManager = loadClipboardManager({
-    spawnSync: createSpawnSync(spawnSyncCalls),
-  });
-  const manager = new TestClipboardManager();
-  manager.commandExists = (cmd) => ["wl-copy", "xclip"].includes(cmd);
-  resetClipboard();
-
-  await withWaylandEnvironment("GNOME", async () => {
-    manager._writeClipboardWayland("gnome text");
-  });
-
-  const commands = spawnSyncCalls.map((call) => call.command);
-  assert.deepEqual(commands, ["wl-copy"]);
-  assert.equal(fakeClipboard.text, "gnome text");
 });

@@ -2400,15 +2400,11 @@
             "step1Desc": "Starten Sie ydotoold und aktivieren Sie es für jeden Anmeldevorgang.",
             "step2Title": "Prüfen, ob er läuft"
           },
-          "xclip": {
-            "step1Title": "xclip installieren"
-          },
           "wlCopy": {
             "step1Title": "wl-clipboard installieren",
             "step2Title": "Installation überprüfen"
           }
         },
-        "xclipDesc": "Zwischenablage-Tool für KDE-Wayland-Einfügen (xclip oder xsel)",
         "nixos": {
           "intro": "Sie verwenden NixOS. Für das automatische Einfügen werden ydotool und Zugriff auf /dev/uinput benötigt, was NixOS deklarativ gewährt.",
           "detected": "Erkannt",

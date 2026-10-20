@@ -2110,15 +2110,11 @@
             "step1Desc": "Запустите ydotoold и включите его автозапуск при каждом входе.",
             "step2Title": "Проверить, что он работает"
           },
-          "xclip": {
-            "step1Title": "Установить xclip"
-          },
           "wlCopy": {
             "step1Title": "Установить wl-clipboard",
             "step2Title": "Проверить установку"
           }
         },
-        "xclipDesc": "Инструмент буфера обмена для вставки в KDE Wayland (xclip или xsel)",
         "nixos": {
           "intro": "Вы используете NixOS. Для автоматической вставки требуются ydotool и доступ к /dev/uinput — NixOS предоставляет это декларативно.",
           "detected": "Обнаружено",

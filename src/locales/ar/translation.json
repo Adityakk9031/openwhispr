@@ -3750,15 +3750,11 @@
             "step1Desc": "ابدأ ydotoold وقم بتمكينه ليعمل في كل عملية تسجيل دخول.",
             "step2Title": "التحقق من أنه قيد التشغيل"
           },
-          "xclip": {
-            "step1Title": "تثبيت xclip"
-          },
           "wlCopy": {
             "step1Title": "تثبيت wl-clipboard",
             "step2Title": "التحقق من التثبيت"
           }
         },
-        "xclipDesc": "أداة الحافظة للصق في KDE Wayland (xclip أو xsel)",
         "nixos": {
           "intro": "أنت تستخدم NixOS. يتطلب اللصق التلقائي الوصول إلى ydotool و /dev/uinput، والذي يمنحه NixOS بشكل تصريحي.",
           "detected": "تم الكشف عنه",
