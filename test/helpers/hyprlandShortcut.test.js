@@ -113,6 +113,42 @@ test("exports every Hyprland D-Bus toggle", async () => {
   });
 });
 
+test("every Hyprland D-Bus trigger reports its slot and action for the debug log", async () => {
+  let exported;
+  const dbusModule = {
+    sessionBus() {
+      return {
+        connection: { on() {}, end() {} },
+        requestName(_name, _flags, callback) {
+          callback(null, 1);
+        },
+        exportInterface(methods) {
+          exported = methods;
+        },
+      };
+    },
+  };
+  const HyprlandShortcutManager = loadManager(() => "ok\n");
+  await withDbusMock(dbusModule, async () => {
+    const events = [];
+    const manager = new HyprlandShortcutManager();
+    manager.onHotkeyEvent = (slotName, action) => events.push([slotName, action]);
+    assert.equal(await manager.initDBusService(() => {}), true);
+
+    exported.Toggle();
+    exported.ToggleMeeting();
+    exported.PttDown();
+    exported.PttUp();
+
+    assert.deepEqual(events, [
+      ["dictation", "press"],
+      ["meeting", "press"],
+      ["dictation", "down"],
+      ["dictation", "up"],
+    ]);
+  });
+});
+
 test("fails D-Bus initialization when the connection errors before RequestName replies", async () => {
   let onError;
   const dbusModule = {

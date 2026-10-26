@@ -89,6 +89,7 @@ OpenWhispr is an Electron-based desktop dictation application that uses whisper.
   - Integrates with GnomeShortcutManager for GNOME Wayland support
   - Integrates with HyprlandShortcutManager for Hyprland Wayland support
   - Integrates with KDEShortcutManager for KDE Wayland support
+  - Each press and release of a bound hotkey writes a debug-level `Hotkey event` line (`logHotkeyEvent`: source, action, key, owning slots, activation mode; key names only). Unbound keys and hotkey capture are skipped, since the macOS listener reports every right modifier and side mouse button. Every `globalShortcut` registration goes through `registerGlobalShortcut`, which logs a held key once and leaves keys the Windows/Linux listener watches to that listener; GNOME, KDE and Hyprland report through their `onHotkeyEvent` hook, and `handleMacPushModifierUp` logs the release of a macOS compound hold
 - **gnomeShortcut.js**: GNOME Wayland global shortcut integration
   - Uses D-Bus service to receive hotkey toggle commands
   - Registers shortcuts via gsettings (visible in GNOME Settings → Keyboard → Shortcuts)

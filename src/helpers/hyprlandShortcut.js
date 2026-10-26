@@ -204,6 +204,8 @@ class HyprlandShortcutManager {
     this.persistencePending = false;
     this.config = null;
     this.dbusNameRequestTimeoutMs = dbusNameRequestTimeoutMs;
+    // Set by HotkeyManager to debug-log each press: (slotName, action).
+    this.onHotkeyEvent = null;
   }
 
   /**
@@ -283,15 +285,18 @@ class HyprlandShortcutManager {
       const toggleMethods = {};
       for (const [slot, method] of Object.entries(SLOT_TOGGLE_METHOD)) {
         toggleMethods[method] = () => {
+          this.onHotkeyEvent?.(slot, "press");
           const cb = this.callbacks[slot];
           if (typeof cb === "function") cb();
         };
       }
       toggleMethods.PttDown = () => {
+        this.onHotkeyEvent?.("dictation", "down");
         const cb = this.callbacks.dictation;
         if (typeof cb === "function") cb(undefined, "down");
       };
       toggleMethods.PttUp = () => {
+        this.onHotkeyEvent?.("dictation", "up");
         const cb = this.callbacks.dictation;
         if (typeof cb === "function") cb(undefined, "up");
       };

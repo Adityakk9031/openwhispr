@@ -4552,7 +4552,7 @@ class IPCHandlers {
                 `[IPC] Re-registering globalShortcut "${accelerator}" after capture mode`
               );
               const callback = this.windowManager.createHotkeyCallback();
-              const registered = globalShortcut.register(accelerator, () => callback(hk));
+              const registered = hotkeyManager.registerGlobalShortcut(accelerator, hk, callback);
               if (!registered) {
                 debugLogger.warn(
                   `[IPC] Failed to re-register globalShortcut "${accelerator}" after capture mode`
